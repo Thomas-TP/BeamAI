@@ -49,9 +49,17 @@ lua tests/lua/test_core_smoke.lua
 ```
 Tous passent actuellement.
 
-## Installer et tester — une seule action manuelle
+## Installer et tester
 
-`dist/beamai.zip` a été reconstruit. Remplace l'ancien dans `Documents\BeamNG.drive\0.38\mods\` (même nom, il suffit d'écraser).
+**Le dossier utilisateur BeamNG n'est pas forcément `Documents\BeamNG.drive\<version>\`** — ça dépend de l'installation. Sur ce poste, c'est `%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\` (confirmé en jeu, via la console : `dump(FS:directoryExists(...))` et le contenu réel de `mods\db.json`). Si le mod n'apparaît pas ou ne se charge pas, vérifie d'abord où vit réellement ton dossier de mods avant de chercher plus loin.
+
+**Format retenu : dossier "unpacked"**, pas zip — un zip déposé dans `mods/` a échoué à se monter dans ce cas précis (raison exacte non identifiée ; le dossier `unpacked` est de toute façon plus simple à mettre à jour et plus fiable). Le mod vit à :
+```
+%LOCALAPPDATA%\BeamNG\BeamNG.drive\current\mods\unpacked\beamai\lua\ge\extensions\beamai\
+```
+qui doit contenir directement `core.lua`, `idm.lua`, `roadGraph.lua`, `trafficLights.lua`, `driverProfile.lua`, `mobil.lua`, `avoidance.lua` et le sous-dossier `data\` avec `west_coast_usa.roadgraph.json` — c'est-à-dire une copie de `mod/lua/` de ce dépôt vers `mods/unpacked/beamai/lua/`.
+
+Après toute modification du code, il suffit de recopier `mod/lua/*` par-dessus ce dossier (pas besoin de reconstruire un zip).
 
 ### Test 3 — les trois corrections précédentes (automatique, comme d'habitude)
 
@@ -80,9 +88,8 @@ extensions.beamai_core.setAvoidanceEnabled(true)
 - Si un autre véhicule est présent à proximité pendant la manœuvre : l'évite-t-il, ou fonce-t-il dedans ? (teste ce cas seulement après avoir validé le cas isolé)
 - Toute erreur console au moment de la manœuvre (texte exact).
 
-### Reconstruire le zip après une modification
+### Regénérer le graphe embarqué (rare, seulement si `tools/extract_road_graph.py` change)
 
 ```
 python tools/extract_road_graph.py "<Steam>/content/levels/west_coast_usa.zip" -o mod/lua/ge/extensions/beamai/data/west_coast_usa.roadgraph.json
 ```
-puis compresser le contenu de `mod/` (pas le dossier `mod` lui-même — le zip doit avoir `lua/` à sa racine) en `dist/beamai.zip`.
