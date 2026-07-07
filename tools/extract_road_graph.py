@@ -50,9 +50,18 @@ def load_decal_roads(zf: zipfile.ZipFile) -> list[dict]:
         for obj in iter_jsonl_objects(text):
             if obj.get("class") != "DecalRoad":
                 continue
+            # Most DecalRoad objects are cosmetic decals (lane paint, cracks, tire marks,
+            # gutters, crosswalk paint...) drawn over the real road surface. Confirmed
+            # empirically across every official map: the actual AI navigation layer is
+            # always material "road_invisible" — everything else is visual-only and would
+            # massively over-count junctions if included.
+            if obj.get("material") != "road_invisible":
+                continue
             nodes = obj.get("nodes", [])
             if len(nodes) < 2:
                 continue
+            width = _average_width(nodes)
+            road_class = classify_road_class(width)
             segments.append(
                 {
                     "id": obj.get("persistentId"),
@@ -62,11 +71,45 @@ def load_decal_roads(zf: zipfile.ZipFile) -> list[dict]:
                     "lanesLeft": obj.get("lanesLeft"),
                     "drivability": obj.get("drivability", 1),
                     "material": obj.get("material"),
-                    "roadClass": "unknown",  # not encoded natively; enrich later (section 4.2)
-                    "speedLimit": None,      # not encoded natively; enrich later (section 4.2)
+                    "width": round(width, 2),
+                    # Heuristic only (road width -> class), inspired by OSM's highway=*
+                    # hierarchy — BeamNG does not encode a road class natively. Needs
+                    # manual review / ruleset override (section 4.2, section 6).
+                    "roadClass": road_class,
+                    "speedLimit": DEFAULT_SPEED_LIMIT_KMH.get(road_class),
                 }
             )
     return segments
+
+
+# Heuristic road-width thresholds (metres) -> class, and a default speed limit (km/h)
+# per class. Both are placeholders standing in for data BeamNG does not encode natively
+# — meant to be overridden by a country ruleset (section 6) or manual correction, not
+# treated as ground truth.
+ROAD_CLASS_WIDTH_THRESHOLDS = [
+    (14.0, "trunk"),
+    (9.0, "primary"),
+    (6.5, "secondary"),
+    (0.0, "residential"),
+]
+DEFAULT_SPEED_LIMIT_KMH = {
+    "trunk": 110,
+    "primary": 80,
+    "secondary": 50,
+    "residential": 30,
+}
+
+
+def _average_width(nodes: list[list[float]]) -> float:
+    widths = [n[3] for n in nodes if len(n) > 3]
+    return sum(widths) / len(widths) if widths else 0.0
+
+
+def classify_road_class(width: float) -> str:
+    for threshold, name in ROAD_CLASS_WIDTH_THRESHOLDS:
+        if width >= threshold:
+            return name
+    return "residential"
 
 
 def load_signals(zf: zipfile.ZipFile, level_name: str) -> dict | None:
@@ -81,28 +124,75 @@ def _dist(a, b) -> float:
     return math.sqrt(sum((a[i] - b[i]) ** 2 for i in range(3)))
 
 
+def _normalize(v):
+    length = math.sqrt(sum(c * c for c in v))
+    if length < 1e-6:
+        return [0.0, 0.0, 0.0]
+    return [c / length for c in v]
+
+
+def _tangent_away_from_endpoint(nodes: list[list[float]], end: str) -> list[float]:
+    """Direction pointing from the junction endpoint back into the road (away from it)."""
+    if end == "start":
+        a, b = nodes[0][:3], nodes[1][:3]
+    else:
+        a, b = nodes[-1][:3], nodes[-2][:3]
+    return _normalize([b[i] - a[i] for i in range(3)])
+
+
 def cluster_junctions(segments: list[dict], radius: float = JUNCTION_CLUSTER_RADIUS) -> list[dict]:
     """Group nearby segment endpoints into junction candidates (naive greedy clustering)."""
     endpoints = []
     for seg in segments:
         nodes = seg["nodes"]
-        endpoints.append((seg["id"], nodes[0][:3]))
-        endpoints.append((seg["id"], nodes[-1][:3]))
+        endpoints.append((seg["id"], "start", nodes[0][:3], _tangent_away_from_endpoint(nodes, "start")))
+        endpoints.append((seg["id"], "end", nodes[-1][:3], _tangent_away_from_endpoint(nodes, "end")))
 
     clusters: list[dict] = []
-    for seg_id, pos in endpoints:
+    for seg_id, end, pos, tangent in endpoints:
         match = next((c for c in clusters if _dist(pos, c["position"]) <= radius), None)
         if match is None:
-            clusters.append({"position": list(pos), "segmentIds": {seg_id}})
+            clusters.append({"position": list(pos), "members": [(seg_id, end, tangent)]})
         else:
-            n = len(match["segmentIds"]) + 1
+            n = len(match["members"]) + 1
             match["position"] = [
                 (match["position"][i] * (n - 1) + pos[i]) / n for i in range(3)
             ]
-            match["segmentIds"].add(seg_id)
+            match["members"].append((seg_id, end, tangent))
+
+    for c in clusters:
+        c["segmentIds"] = {m[0] for m in c["members"]}
 
     # A real junction needs 2+ distinct segments meeting; a lone endpoint is a dead end.
     return [c for c in clusters if len(c["segmentIds"]) >= 2]
+
+
+def classify_cluster(cluster: dict, straight_angle_deg: float = 150.0) -> str:
+    """Distinguish a real crossing from a road merely split into consecutive DecalRoad
+    pieces (same logical street, no other street actually meets it here).
+
+    With exactly two segments meeting, if their tangents (pointing away from the
+    junction, back into each segment) are nearly opposite (>150 degrees apart), the
+    road is essentially going straight through the point -> "continuation".
+    Three or more distinct segments, or a sharp/right-angle meeting of two segments,
+    is treated as a real "junction" candidate.
+    """
+    distinct = list(cluster["segmentIds"])
+    if len(distinct) >= 3:
+        return "junction"
+
+    # exactly two distinct segments — take one representative tangent per segment
+    tangents_by_seg = {}
+    for seg_id, _end, tangent in cluster["members"]:
+        tangents_by_seg.setdefault(seg_id, tangent)
+    if len(tangents_by_seg) < 2:
+        return "junction"  # shouldn't happen given the >=2 filter, but stay safe
+
+    t1, t2 = list(tangents_by_seg.values())[:2]
+    dot = sum(t1[i] * t2[i] for i in range(3))
+    dot = max(-1.0, min(1.0, dot))
+    angle = math.degrees(math.acos(dot))
+    return "continuation" if angle >= straight_angle_deg else "junction"
 
 
 def match_traffic_lights(clusters: list[dict], signals: dict | None, radius: float = TRAFFIC_LIGHT_MATCH_RADIUS) -> None:
@@ -135,11 +225,14 @@ def build_graph(level_name: str, zf: zipfile.ZipFile) -> dict:
 
     junctions = []
     for i, c in enumerate(clusters):
+        base_type = classify_cluster(c)
+        # A traffic light is never a mere continuation of the same road.
+        junction_type = "trafficLight" if "trafficLightGroupId" in c else base_type
         junctions.append(
             {
                 "id": f"j_{i:04d}",
                 "position": c["position"],
-                "type": "trafficLight" if "trafficLightGroupId" in c else "unclassified",
+                "type": junction_type,
                 "trafficLightGroupId": c.get("trafficLightGroupId"),
                 "trafficLightControllerIds": c.get("trafficLightControllerIds"),
                 "priorityRule": None,  # section 4.2 / 6 — assign via ruleset or manual editor
@@ -171,9 +264,11 @@ def main() -> None:
     out_path.write_text(json.dumps(graph, indent=2), encoding="utf-8")
 
     n_lit = sum(1 for j in graph["junctions"] if j["type"] == "trafficLight")
+    n_cont = sum(1 for j in graph["junctions"] if j["type"] == "continuation")
+    n_real = sum(1 for j in graph["junctions"] if j["type"] == "junction")
     print(
-        f"{level_name}: {len(graph['segments'])} segments, "
-        f"{len(graph['junctions'])} junction candidates ({n_lit} matched to traffic lights) "
+        f"{level_name}: {len(graph['segments'])} segments, {len(graph['junctions'])} candidates total "
+        f"-> {n_real} real junctions, {n_cont} continuations, {n_lit} traffic-light junctions "
         f"-> {out_path}"
     )
 

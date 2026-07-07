@@ -181,7 +181,13 @@ Le champ `ruleset` permet de charger un jeu de règles par pays/carte (voir sect
 
 Le script `tools/extract_road_graph.py` (aucune dépendance externe, stdlib uniquement) implémente cette première passe : il regroupe les extrémités de segments proches en intersections candidates, puis apparie chaque groupe de feux (`instances[].group`) à l'intersection la plus proche. Testé avec succès sur les cartes officielles `gridmap_v2` (zone `zone_AI_city`, dédiée aux tests d'IA), `west_coast_usa` (12 721 segments, 185 intersections appariées à des feux), `italy` et `Utah`.
 
-**Limite connue de cette première passe** : le regroupement d'extrémités est naïf et détecte aussi des points où une route se poursuit simplement en ligne droite (une route découpée en plusieurs `DecalRoad` consécutifs), pas seulement les vrais croisements — d'où un nombre de « candidats » nettement supérieur au nombre réel de carrefours. Une prochaine itération devra comparer le cap des segments au point de jonction pour ne garder que les vraies divergences, avant de proposer un type de priorité par défaut selon la hiérarchie `roadClass` (comme la hiérarchie implicite `highway=*` d'OSM) — cette donnée de classement n'est elle-même pas encodée nativement et reste à construire. Un outil d'édition visuelle (petite webapp locale) permettra ensuite de corriger les cas ambigus à la main. Pour les cartes importées depuis OpenStreetMap (via un pipeline inspiré de MapNG), les tags `highway`, `maxspeed`, `oneway`, `junction=roundabout`, `traffic_signals`, `highway=stop` vs `give_way`, `priority_road` alimenteront directement ce schéma, quasi automatiquement.
+**Deux affinages déjà apportés après validation sur les cartes officielles** :
+1. La grande majorité des objets `DecalRoad` d'une carte ne sont pas des routes navigables mais des décalques cosmétiques (peinture au sol `line_white`/`line_yellow`, fissures, traces de pneus, caniveaux, passages piétons peints…) posés sur la vraie surface de route. Confirmé empiriquement sur `west_coast_usa` (12 721 `DecalRoad` au total) : la couche de navigation IA utilise systématiquement, sur toutes les cartes testées, le matériau `road_invisible` (1 303 segments pour `west_coast_usa`, contre 12 721 sans filtre) — c'est le seul filtre fiable trouvé pour isoler les routes réellement empruntables par l'IA.
+2. Le regroupement d'extrémités proches en carrefour est complété par une comparaison de cap (`classify_cluster`) : si exactement deux segments se rencontrent avec des tangentes quasi opposées (>150°), c'est qu'une route continue simplement en ligne droite (découpée en plusieurs `DecalRoad` consécutifs) — classé `continuation`, pas un vrai carrefour.
+
+Résultat sur `west_coast_usa` après ces deux filtres : 1 303 segments réels, 646 candidats, dont 337 vrais carrefours + 130 carrefours à feux (130, contre 185 avant filtrage — l'ancien chiffre incluait des faux positifs près de décors) + 179 continuations écartées.
+
+**Limite restante** : le type de priorité (stop / cédez-le-passage / priorité à droite) des « vrais carrefours » non signalés reste `null` — cette donnée n'est encodée nulle part nativement. La proposer par défaut selon la hiérarchie `roadClass` (déjà calculée par heuristique de largeur, à l'image de la hiérarchie implicite `highway=*` d'OSM) puis la corriger à la main via une petite webapp locale reste la prochaine étape. Pour les cartes importées depuis OpenStreetMap (pipeline inspiré de MapNG), les tags `highway`, `maxspeed`, `oneway`, `junction=roundabout`, `traffic_signals`, `highway=stop` vs `give_way`, `priority_road` alimenteront directement ce schéma, quasi automatiquement.
 
 ### 4.3 Décision — Behavior Tree plutôt que FSM rigide
 
@@ -366,7 +372,7 @@ Pour une carte officielle BeamNG (ex. West Coast USA, Italy, Utah), le ruleset p
 | Phase | Contenu | Objectif de sortie |
 |---|---|---|
 | 0 — fait | Recherche BeamNG/modding, simulateurs comparables, IA réelle & académique | Ce document |
-| 1 — Fondations | Extracteur de graphe routier sémantique (une carte de test), IDM basique, respect des feux | Un véhicule IA suit sa voie, s'arrête aux feux rouges, accélère/freine sans à-coups |
+| 1 — Fondations *(en cours)* | Extracteur de graphe routier sémantique ✅, IDM basique ✅ (testé unitairement, sans collision), lecture des feux ⏳ (pas encore câblée). `core.lua` orchestre déjà la boucle IDM sur une voie sans intersection mais n'a pas encore été validé en jeu | Un véhicule IA suit sa voie, s'arrête aux feux rouges, accélère/freine sans à-coups |
 | 2 — Intersections | Priorité à droite, stops, cédez-le-passage, ronds-points, négociation multi-véhicules | Une intersection non signalée est négociée correctement entre plusieurs IA |
 | 3 — Comportement avancé | Dépassement, fusion, MOBIL, clignotants, contrôles visuels | Trafic fluide sur route à deux voies avec dépassements crédibles |
 | 4 — Sécurité & incidents | Couche RSS/SFF, accidents, véhicules d'urgence, travaux/déviations | Un accident déclenche une réaction réaliste en chaîne |
@@ -390,8 +396,11 @@ Pour une carte officielle BeamNG (ex. West Coast USA, Italy, Utah), le ruleset p
 
 ## 10. Prochaine étape concrète
 
-1. ~~Initialiser un dépôt Git pour le projet.~~ Fait.
+1. ~~Initialiser un dépôt Git pour le projet.~~ Fait — [github.com/Thomas-TP/BeamAI](https://github.com/Thomas-TP/BeamAI).
 2. ~~Écrire le script Python d'extraction du graphe routier.~~ Fait — `tools/extract_road_graph.py`, validé sur `gridmap_v2`, `west_coast_usa`, `italy`, `Utah` sans dépendance externe.
-3. Affiner la détection de jonctions (distinguer une vraie divergence d'une simple continuation de route en comparant les caps des segments au point de jonction) et assigner un `roadClass` par segment.
-4. Implémenter en Vehicle Lua un contrôleur IDM basique + lecture de l'état des feux (`trafficSignals.lua`), sur la zone de test `gridmap_v2 / zone_AI_city` (petite, sans intersection complexe, conçue par BeamNG pour les tests d'IA).
-5. Valider visuellement (overlay de debug minimal) avant d'attaquer la phase 2 (intersections).
+3. ~~Affiner la détection de jonctions~~ Fait — filtrage sur le matériau `road_invisible` (élimine les décalques cosmétiques) + comparaison de cap pour distinguer une vraie divergence d'une simple continuation de route ; `roadClass`/`speedLimit` assignés par heuristique de largeur.
+4. ~~Écrire le module IDM (`mod/lua/ge/extensions/beamai/idm.lua`)~~ Fait — testé unitairement en Lua (5 scénarios, y compris une simulation complète d'arrêt sans collision).
+5. ~~Écrire le module de graphe routier (`roadGraph.lua`) et l'orchestrateur (`core.lua`)~~ Fait — géométrie (`closestPointOnPolyline`, `distanceAlong`) testée unitairement ; `core.lua` orchestre déjà la boucle IDM sur une voie sans intersection mais **n'a pas encore été validé en jeu** (voir avertissement en tête de fichier et `README.md`).
+6. Câbler la lecture de l'état des feux (`extensions.core_trafficSignals` / `trafficSignals.lua`) dans `core.lua`, encore absente.
+7. Charger le mod dans BeamNG.drive sur la zone de test `gridmap_v2 / zone_AI_city`, valider en jeu (overlay de debug minimal), corriger les appels d'API qui ne correspondent pas exactement à la version installée.
+8. Une fois la phase 1 validée en jeu, attaquer la phase 2 (intersections).
