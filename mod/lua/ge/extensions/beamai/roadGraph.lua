@@ -84,6 +84,29 @@ function M.distanceAlong(nodes, fromPos, toPos)
   return cumulativeAt(toPos) - cumulativeAt(fromPos)
 end
 
+-- Total arc length of a polyline (list of {x,y,z,...} nodes).
+function M.segmentLength(nodes)
+  local total = 0.0
+  for i = 1, #nodes - 1 do
+    total = total + vlen(vsub(nodes[i + 1], nodes[i]))
+  end
+  return total
+end
+
+-- Finds the closest junction to `point` within `radius` metres, or nil if none.
+-- Used to check whether a segment's far end (the direction of travel) leads
+-- into a signalized junction -- see core.lua.
+function M.findJunctionNear(graph, point, radius)
+  local best, bestDist = nil, nil
+  for _, j in ipairs(graph.junctions) do
+    local d = vlen(vsub(j.position, point))
+    if d <= radius and (bestDist == nil or d < bestDist) then
+      best, bestDist = j, d
+    end
+  end
+  return best
+end
+
 function M.findSegmentById(graph, id)
   for _, seg in ipairs(graph.segments) do
     if seg.id == id then

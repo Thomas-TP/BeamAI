@@ -16,12 +16,15 @@
 
 local idm = require("idm")
 local roadGraph = require("roadGraph")
+local trafficLights = require("trafficLights")
 
 local M = {}
 
 M.enabled = false
 M.graph = nil
 local trackedVehicleIds = {}
+local JUNCTION_SEARCH_RADIUS = 8.0 -- metres; matches the extractor's clustering radius (~6m) plus margin
+local warnedNoLiveTrafficLightState = false
 
 -- Call from the GE Lua console: extensions.beamai_core.setGraphPath("...")
 function M.setGraphPath(path)
@@ -48,6 +51,23 @@ end
 
 function M.unregisterVehicle(vehId)
   trackedVehicleIds[vehId] = nil
+end
+
+-- Convenience for manual testing: registers every vehicle currently spawned in
+-- the level, so there is no need to hunt down individual vehicle IDs in the
+-- console. Call again after spawning more vehicles.
+function M.registerAll()
+  local n = be:getObjectCount()
+  local count = 0
+  for i = 0, n - 1 do
+    local obj = be:getObject(i)
+    if obj then
+      trackedVehicleIds[obj:getID()] = true
+      count = count + 1
+    end
+  end
+  log("I", "beamai_core", string.format("registerAll: now tracking %d vehicle(s)", count))
+  return count
 end
 
 -- Sends a target speed (m/s) into vehId's own Vehicle Lua VM via its AI controller.
@@ -79,6 +99,39 @@ local function findLeaderOnSegment(segment, ownVehId, ownProj, positionsById)
   return bestGap, bestSpeed
 end
 
+-- If `segment` ends at a traffic-light junction and that light is not green,
+-- returns the gap (metres) from `ownProj` to the stop line, treating it as a
+-- stationary virtual leader. Returns nil if the light is green, unclassified,
+-- too far, or already passed -- i.e. "no constraint from a light here".
+--
+-- Fails safe by design (docs/ARCHITECTURE.md section 4.5): if the live state
+-- can't be read at all, isStopState(nil) is true, so an unreadable light is
+-- treated as red, never as green.
+local function findStopLineConstraint(graph, segment, ownProj)
+  local endNode = segment.nodes[#segment.nodes]
+  local junction = roadGraph.findJunctionNear(graph, { endNode[1], endNode[2], endNode[3] }, JUNCTION_SEARCH_RADIUS)
+  if not junction or junction.type ~= "trafficLight" then
+    return nil
+  end
+
+  local state = trafficLights.queryLiveState(junction.trafficLightGroupId, junction.trafficLightControllerIds)
+  if state == nil and not warnedNoLiveTrafficLightState then
+    warnedNoLiveTrafficLightState = true
+    log("W", "beamai_core",
+      "could not read live traffic light state (extensions.core_trafficSignals accessor not confirmed yet -- "
+      .. "see trafficLights.lua). Failing safe: treating unreadable lights as red until fixed.")
+  end
+  if not trafficLights.isStopState(state) then
+    return nil -- confirmed green: no constraint from this light
+  end
+
+  local gap = roadGraph.segmentLength(segment.nodes) - ownProj.distanceAlong
+  if gap <= 0 then
+    return nil -- already at or past the stop line
+  end
+  return gap
+end
+
 function M.onUpdate(dtReal, dtSim, dtRaw)
   if not M.enabled or not M.graph then
     return
@@ -105,11 +158,19 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
   for vehId, data in pairs(positionsById) do
     local segment, ownProj = roadGraph.findNearestSegment(M.graph, data.pos)
     if segment and ownProj then
-      local gap, leaderSpeed = findLeaderOnSegment(segment, vehId, ownProj, positionsById)
-      -- TODO (phase 2): when gap is nil, check the segment's terminal junction
-      -- for a red/yellow trafficLight via extensions.core_trafficSignals and
-      -- treat the stop line as a virtual leader at speed 0. Not implemented
-      -- yet -- this v0 targets a single lane with no intersection.
+      local vehGap, vehLeaderSpeed = findLeaderOnSegment(segment, vehId, ownProj, positionsById)
+      local lightGap = findStopLineConstraint(M.graph, segment, ownProj)
+
+      -- Whichever obstacle is nearer along the path is the binding constraint
+      -- for IDM (same simplification used by most simple traffic-AI stacks:
+      -- the stop line is just a stationary leader at speed 0).
+      local gap, leaderSpeed
+      if lightGap ~= nil and (vehGap == nil or lightGap < vehGap) then
+        gap, leaderSpeed = lightGap, 0
+      else
+        gap, leaderSpeed = vehGap, vehLeaderSpeed
+      end
+
       local targetSpeed = idm.nextSpeed(data.speed, leaderSpeed or 0, gap, dtSim)
       dispatchSpeed(data.obj, targetSpeed)
     end

@@ -77,6 +77,25 @@ do
   check("nearest segment is seg_perp", seg2.id == "seg_perp")
 end
 
+print("Test 6b: segmentLength")
+do
+  check("100m straight road", near(rg.segmentLength(straightNodes), 100, 1e-6))
+end
+
+print("Test 6c: findJunctionNear")
+do
+  local graph = {
+    junctions = {
+      { id = "j_far", position = { 1000, 1000, 0 }, type = "trafficLight" },
+      { id = "j_near", position = { 100, 2, 0 }, type = "trafficLight" },
+    },
+  }
+  local found = rg.findJunctionNear(graph, { 100, 0, 0 }, 6.0)
+  check("finds the nearby junction", found ~= nil and found.id == "j_near")
+  local notFound = rg.findJunctionNear(graph, { 100, 0, 0 }, 1.0)
+  check("returns nil when out of radius", notFound == nil)
+end
+
 print("Test 6: findSegmentById")
 do
   local graph = { segments = { { id = "a" }, { id = "b" } } }

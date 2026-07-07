@@ -246,6 +246,15 @@ def build_graph(level_name: str, zf: zipfile.ZipFile) -> dict:
         "segments": segments,
         "parkingZones": [],  # section 4.3bis — not derivable from DecalRoad, needs its own pass
         "junctions": junctions,
+        # Raw controller/sequence definitions from signals.json, kept as reference
+        # data (e.g. for an in-game debug overlay comparing our reading of a light
+        # to its actual cycle). core.lua does not self-simulate light timing from
+        # this -- it queries the game's own live trafficSignals state instead, since
+        # BeamNG is already animating the real light poles and our AI must match
+        # what the player sees, not run a parallel clock that could drift out of
+        # sync (see docs/ARCHITECTURE.md section 4, trafficLights.lua).
+        "trafficLightControllers": (signals or {}).get("controllers", []),
+        "trafficLightSequences": (signals or {}).get("sequences", []),
     }
 
 

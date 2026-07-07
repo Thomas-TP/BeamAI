@@ -372,7 +372,7 @@ Pour une carte officielle BeamNG (ex. West Coast USA, Italy, Utah), le ruleset p
 | Phase | Contenu | Objectif de sortie |
 |---|---|---|
 | 0 — fait | Recherche BeamNG/modding, simulateurs comparables, IA réelle & académique | Ce document |
-| 1 — Fondations *(en cours)* | Extracteur de graphe routier sémantique ✅, IDM basique ✅ (testé unitairement, sans collision), lecture des feux ⏳ (pas encore câblée). `core.lua` orchestre déjà la boucle IDM sur une voie sans intersection mais n'a pas encore été validé en jeu | Un véhicule IA suit sa voie, s'arrête aux feux rouges, accélère/freine sans à-coups |
+| 1 — Fondations *(en cours)* | Extracteur ✅, IDM ✅, lecture des feux ✅ (code écrit, échoue en sécurité si l'API réelle diffère) — tout testé unitairement hors-jeu. Reste : validation en jeu (2 tests définis dans README.md, jamais encore exécutés — cette machine ne peut pas lancer BeamNG.drive) | Un véhicule IA suit sa voie, s'arrête aux feux rouges, accélère/freine sans à-coups |
 | 2 — Intersections | Priorité à droite, stops, cédez-le-passage, ronds-points, négociation multi-véhicules | Une intersection non signalée est négociée correctement entre plusieurs IA |
 | 3 — Comportement avancé | Dépassement, fusion, MOBIL, clignotants, contrôles visuels | Trafic fluide sur route à deux voies avec dépassements crédibles |
 | 4 — Sécurité & incidents | Couche RSS/SFF, accidents, véhicules d'urgence, travaux/déviations | Un accident déclenche une réaction réaliste en chaîne |
@@ -401,6 +401,6 @@ Pour une carte officielle BeamNG (ex. West Coast USA, Italy, Utah), le ruleset p
 3. ~~Affiner la détection de jonctions~~ Fait — filtrage sur le matériau `road_invisible` (élimine les décalques cosmétiques) + comparaison de cap pour distinguer une vraie divergence d'une simple continuation de route ; `roadClass`/`speedLimit` assignés par heuristique de largeur.
 4. ~~Écrire le module IDM (`mod/lua/ge/extensions/beamai/idm.lua`)~~ Fait — testé unitairement en Lua (5 scénarios, y compris une simulation complète d'arrêt sans collision).
 5. ~~Écrire le module de graphe routier (`roadGraph.lua`) et l'orchestrateur (`core.lua`)~~ Fait — géométrie (`closestPointOnPolyline`, `distanceAlong`) testée unitairement ; `core.lua` orchestre déjà la boucle IDM sur une voie sans intersection mais **n'a pas encore été validé en jeu** (voir avertissement en tête de fichier et `README.md`).
-6. Câbler la lecture de l'état des feux (`extensions.core_trafficSignals` / `trafficSignals.lua`) dans `core.lua`, encore absente.
-7. Charger le mod dans BeamNG.drive sur la zone de test `gridmap_v2 / zone_AI_city`, valider en jeu (overlay de debug minimal), corriger les appels d'API qui ne correspondent pas exactement à la version installée.
+6. ~~Câbler la lecture de l'état des feux~~ Fait — `trafficLights.lua` interroge `extensions.core_trafficSignals` (accesseur deviné, à confirmer) plutôt que de re-simuler le cycle localement (choix motivé : ne pas risquer un décalage avec le vrai feu affiché au joueur ; voir en-tête du fichier). Échoue en sécurité : un état illisible est traité comme rouge, jamais comme vert.
+7. **Bloqué en attente de test en jeu** — cette machine ne peut pas lancer BeamNG.drive. Deux tests précis sont définis dans `README.md` (« Tests en jeu à faire ») : Test 1 (boucle IDM de base, sans feux) puis Test 2 (lecture des feux). Dès leurs résultats rapportés, corriger les appels d'API qui ne correspondent pas à la version installée.
 8. Une fois la phase 1 validée en jeu, attaquer la phase 2 (intersections).
