@@ -215,6 +215,18 @@ def match_traffic_lights(clusters: list[dict], signals: dict | None, radius: flo
             best["trafficLightControllerIds"] = sorted(
                 {i["controllerId"] for i in instances if "controllerId" in i}
             )
+            # Per-instance id + facing direction, so core.lua can pick, at runtime, the
+            # specific physical light that governs a given approach direction (an
+            # intersection's "group" bundles instances facing every direction, e.g. both
+            # NS and EW) and query its live state via the confirmed real API:
+            # extensions.core_trafficSignals.getElementById(id):getState()
+            # (read directly from lua/ge/extensions/core/trafficSignals.lua in the game
+            # install -- see docs/ARCHITECTURE.md section 4).
+            best["trafficLightInstances"] = [
+                {"id": i["id"], "dir": i["dir"], "controllerId": i.get("controllerId")}
+                for i in instances
+                if "id" in i and "dir" in i
+            ]
 
 
 def build_graph(level_name: str, zf: zipfile.ZipFile) -> dict:
@@ -235,6 +247,7 @@ def build_graph(level_name: str, zf: zipfile.ZipFile) -> dict:
                 "type": junction_type,
                 "trafficLightGroupId": c.get("trafficLightGroupId"),
                 "trafficLightControllerIds": c.get("trafficLightControllerIds"),
+                "trafficLightInstances": c.get("trafficLightInstances"),
                 "priorityRule": None,  # section 4.2 / 6 — assign via ruleset or manual editor
                 "approaches": sorted(c["segmentIds"]),
             }

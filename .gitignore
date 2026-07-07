@@ -2,3 +2,5 @@ __pycache__/
 *.pyc
 .venv/
 *.roadgraph.json
+!mod/lua/ge/extensions/beamai/data/*.roadgraph.json
+dist/

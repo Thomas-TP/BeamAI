@@ -77,6 +77,13 @@ do
   check("nearest segment is seg_perp", seg2.id == "seg_perp")
 end
 
+print("Test 5b: tangentAtProjection")
+do
+  local proj = rg.closestPointOnPolyline(straightNodes, { 60, 0, 0 })
+  local tangent = rg.tangentAtProjection(straightNodes, proj)
+  check("points along +X", near(tangent[1], 1, 1e-6) and near(tangent[2], 0, 1e-6))
+end
+
 print("Test 6b: segmentLength")
 do
   check("100m straight road", near(rg.segmentLength(straightNodes), 100, 1e-6))

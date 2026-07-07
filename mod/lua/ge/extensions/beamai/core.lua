@@ -6,13 +6,18 @@
 -- MOBIL lane changes, the safety layer, the population lifecycle...) is later
 -- phases and deliberately not attempted here.
 --
--- NOT YET VALIDATED IN-GAME. Written against documented/well-established BeamNG
--- Lua conventions (GE extension shape, `be`/vehicle object API, queueLuaCommand
--- to reach a vehicle's own AI Lua VM, jsonDecode/readFile globals), but this
--- machine cannot run BeamNG.drive interactively, so every call into the engine
--- API below is best-effort and flagged where its exact signature is uncertain.
--- Load in-game, watch the console, and fix up anything that errors before
--- trusting this beyond a single test vehicle on an empty road.
+-- STILL NOT RUN IN-GAME (this machine cannot launch BeamNG.drive), but every
+-- engine API call below has been checked against the actual installed game's
+-- own Lua source (read directly off disk: lua/ge/ge_utils.lua, lua/ge/extensions
+-- /core/vehicles.lua, lua/vehicle/ai.lua, lua/ge/extensions/core/trafficSignals.lua)
+-- rather than guessed: be:getObjectCount/getObject/getObjectByID, obj:getPosition/
+-- getVelocity/getID/queueLuaCommand, ai.setSpeed/setSpeedMode all match confirmed
+-- real usage elsewhere in the game's own code. What's still genuinely unverified
+-- is *behavioural*, not API shape: does this actually produce sane driving once
+-- running, does pickBestInstance (trafficLights.lua) pick the right light, does
+-- a vehicle need to already be in an active AI mode for setSpeed to have any
+-- effect (assumed yes, see initSpeedControl below). Load in-game, watch the
+-- console -- see README.md "Test 1" / "Test 2".
 
 local idm = require("idm")
 local roadGraph = require("roadGraph")
@@ -25,6 +30,15 @@ M.graph = nil
 local trackedVehicleIds = {}
 local JUNCTION_SEARCH_RADIUS = 8.0 -- metres; matches the extractor's clustering radius (~6m) plus margin
 local warnedNoLiveTrafficLightState = false
+local REGISTER_SCAN_INTERVAL = 3.0 -- seconds between automatic re-scans for newly spawned vehicles
+local timeSinceLastScan = math.huge -- forces an immediate scan on the first onUpdate
+
+-- Maps a level name (as returned by path.levelFromPath) to a bundled road
+-- graph shipped inside this mod, for fully automatic setup -- no console
+-- commands needed. See tools/extract_road_graph.py and README.md.
+local BUNDLED_GRAPHS = {
+  west_coast_usa = "lua/ge/extensions/beamai/data/west_coast_usa.roadgraph.json",
+}
 
 -- Call from the GE Lua console: extensions.beamai_core.setGraphPath("...")
 function M.setGraphPath(path)
@@ -45,8 +59,31 @@ function M.setEnabled(value)
   M.enabled = value and true or false
 end
 
+-- CONFIRMED against the actual installed game's source (lua/vehicle/ai.lua,
+-- read directly from disk): ai.setSpeed(speed) takes ONLY the number -- the
+-- 'limit' vs 'set' vs 'legal' behaviour is a *separate* call,
+-- ai.setSpeedMode(mode), gating whether/how routeSpeed is applied. So each
+-- newly tracked vehicle gets setSpeedMode('limit') once; dispatchSpeed only
+-- ever touches setSpeed after that.
+--
+-- Assumption this v0 depends on (not yet validated in-game, see README.md
+-- "Test 1"): the vehicle is *already* in an active AI driving mode (e.g.
+-- spawned as traffic, or set via the in-game AI/Traffic app) before being
+-- registered here. ai.lua's setMode('traffic') has real side effects (forces
+-- speedMode back to 'legal', changes collision/aerodynamics model, enables
+-- lane-following) that this mod does not attempt to reproduce or override --
+-- calling ai.setMode ourselves was deliberately avoided to not fight whatever
+-- mode already governs the vehicle.
+local function initSpeedControl(vehId)
+  local obj = be:getObjectByID(vehId)
+  if obj then
+    obj:queueLuaCommand("ai.setSpeedMode('limit')")
+  end
+end
+
 function M.registerVehicle(vehId)
   trackedVehicleIds[vehId] = true
+  initSpeedControl(vehId)
 end
 
 function M.unregisterVehicle(vehId)
@@ -62,7 +99,9 @@ function M.registerAll()
   for i = 0, n - 1 do
     local obj = be:getObject(i)
     if obj then
-      trackedVehicleIds[obj:getID()] = true
+      local vehId = obj:getID()
+      trackedVehicleIds[vehId] = true
+      initSpeedControl(vehId)
       count = count + 1
     end
   end
@@ -70,11 +109,11 @@ function M.registerAll()
   return count
 end
 
--- Sends a target speed (m/s) into vehId's own Vehicle Lua VM via its AI controller.
--- Mirrors BeamNGpy's AIApi.set_speed(speed, mode="limit") found in research
--- (section 2.1 of docs/ARCHITECTURE.md) -- confirm `ai.setSpeed` signature in-game.
+-- Sends a target speed (m/s) into vehId's own Vehicle Lua VM via its AI
+-- controller. Requires setSpeedMode('limit') to have been sent already
+-- (see initSpeedControl above), otherwise ai.lua ignores routeSpeed.
 local function dispatchSpeed(vehObj, speedMs)
-  vehObj:queueLuaCommand(string.format("ai.setSpeed(%f, 'limit')", speedMs))
+  vehObj:queueLuaCommand(string.format("ai.setSpeed(%f)", speedMs))
 end
 
 -- Finds the closest other tracked vehicle ahead of `ownProj` on the same segment.
@@ -114,7 +153,8 @@ local function findStopLineConstraint(graph, segment, ownProj)
     return nil
   end
 
-  local state = trafficLights.queryLiveState(junction.trafficLightGroupId, junction.trafficLightControllerIds)
+  local travelDir = roadGraph.tangentAtProjection(segment.nodes, ownProj)
+  local state = trafficLights.queryLiveState(junction.trafficLightInstances, travelDir)
   if state == nil and not warnedNoLiveTrafficLightState then
     warnedNoLiveTrafficLightState = true
     log("W", "beamai_core",
@@ -132,9 +172,40 @@ local function findStopLineConstraint(graph, segment, ownProj)
   return gap
 end
 
+-- Auto-run hook: confirmed real signature (lua/ge/extensions/career/career.lua
+-- and others), fired once a level finishes loading, with the level path. If we
+-- have a bundled graph for this level, load it and switch on automatically --
+-- no console commands needed for the zip-and-drop test (README.md).
+function M.onClientStartMission(levelPath)
+  local levelName = path.levelFromPath(levelPath)
+  local graphPath = BUNDLED_GRAPHS[levelName]
+  if not graphPath then
+    log("I", "beamai_core", "no bundled road graph for level '" .. tostring(levelName) .. "', staying idle")
+    return
+  end
+  timeSinceLastScan = math.huge
+  if M.setGraphPath(graphPath) then
+    M.setEnabled(true)
+  end
+end
+
+function M.onClientEndMission()
+  M.setEnabled(false)
+  M.graph = nil
+  trackedVehicleIds = {}
+end
+
 function M.onUpdate(dtReal, dtSim, dtRaw)
   if not M.enabled or not M.graph then
     return
+  end
+
+  -- Automatically pick up newly spawned/despawned vehicles every few seconds,
+  -- so nobody has to call registerAll() by hand after spawning traffic.
+  timeSinceLastScan = timeSinceLastScan + dtSim
+  if timeSinceLastScan >= REGISTER_SCAN_INTERVAL then
+    timeSinceLastScan = 0
+    M.registerAll()
   end
 
   -- Snapshot every tracked vehicle's position/speed once per tick (avoids

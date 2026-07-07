@@ -84,6 +84,19 @@ function M.distanceAlong(nodes, fromPos, toPos)
   return cumulativeAt(toPos) - cumulativeAt(fromPos)
 end
 
+-- Normalized travel direction at a projection (as returned by
+-- closestPointOnPolyline): the direction of the polyline's sub-segment the
+-- projection falls on, in node order.
+function M.tangentAtProjection(nodes, proj)
+  local a, b = nodes[proj.segmentIndex], nodes[proj.segmentIndex + 1]
+  local d = vsub(b, a)
+  local len = vlen(d)
+  if len < 1e-9 then
+    return { 0, 0, 0 }
+  end
+  return { d[1] / len, d[2] / len, d[3] / len }
+end
+
 -- Total arc length of a polyline (list of {x,y,z,...} nodes).
 function M.segmentLength(nodes)
   local total = 0.0
@@ -130,14 +143,16 @@ function M.findNearestSegment(graph, point)
 end
 
 -- Loads a graph JSON file produced by tools/extract_road_graph.py.
--- Requires BeamNG's engine-provided `readFile` and `jsonDecode` globals --
--- not usable outside the game; needs in-game confirmation of exact signatures.
+-- Uses BeamNG's engine-provided `jsonReadFile` global (confirmed against the
+-- actual installed game's source, e.g. lua/ge/extensions/core/trafficSignals.lua
+-- and core/vehicles.lua, both of which load their own JSON data this same way)
+-- -- not usable outside the game.
 function M.loadGraph(path)
-  local text = readFile(path)
-  if not text then
-    return nil, "could not read " .. tostring(path)
+  local graph = jsonReadFile(path)
+  if not graph then
+    return nil, "could not read/parse " .. tostring(path)
   end
-  return jsonDecode(text)
+  return graph
 end
 
 return M
