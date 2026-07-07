@@ -8,7 +8,7 @@ Plan complet et architecture : [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 
 ### `tools/extract_road_graph.py`
 
-Extrait un graphe routier sémantique (segments + intersections + feux) directement depuis un fichier `.zip` de carte BeamNG.drive standard — aucune instance du jeu en cours d'exécution requise, aucun BeamNG.tech/BeamNGpy nécessaire pour cette étape.
+Extrait un graphe routier sémantique (segments + intersections + feux) directement depuis un fichier `.zip` de carte BeamNG.drive standard — aucune instance du jeu en cours d'exécution requise, aucun BeamNG.tech/BeamNGpy nécessaire pour cette étape. Capture aussi `flipDirection` (le champ natif de BeamNG qui inverse le sens de circulation d'un segment `oneWay`) depuis peu — nécessaire pour que le routage (`router.lua`) ne propose jamais un trajet à contre-sens ; environ la moitié des segments de `west_coast_usa` sont `oneWay` (souvent une seule chaussée d'une route à double sens plutôt qu'une vraie rue à sens unique), donc ce n'est pas un cas marginal.
 
 ```
 python tools/extract_road_graph.py "<Steam>/steamapps/common/BeamNG.drive/content/levels/west_coast_usa.zip"
@@ -27,6 +27,7 @@ Le mod lui-même (Game Engine Lua) :
 - `avoidance.lua` — machine à états (idle → contournement → retour) qui gère la durée/l'hystérésis du contournement, plus un décalage latéral continu et progressif (`currentOffsetMetres`) utilisé en pilotage complet ; pure et testée
 - `steeringController.lua` — **contrôleur de direction maison** (pure pursuit) : calcule l'angle de braquage à partir de la position/cap/vitesse du véhicule et d'un point de visée sur notre propre graphe routier
 - `speedController.lua` — **contrôleur de vitesse maison** (PID) : convertit une vitesse cible en accélérateur/frein
+- `router.lua` — **routage A\*** sur le graphe de segments : calcule un itinéraire entre un segment de départ et un segment de destination, en respectant les sens uniques (`oneWay`/`flipDirection`) ; nouveau, testé unitairement (8 scénarios), **pas encore branché sur le comportement des véhicules** — voir Statut
 - `core.lua` — orchestrateur : au chargement d'une carte pour laquelle un graphe est fourni, charge le graphe et enregistre automatiquement tous les véhicules (et re-scanne toutes les 3s) — aucune commande console requise pour la partie validée
 - `data/west_coast_usa.roadgraph.json` — graphe pré-généré, embarqué dans le mod
 
@@ -37,9 +38,11 @@ Chaque appel à l'API du jeu a été vérifié directement dans le code source d
 **Zéro commande console requise** : au chargement d'une carte pour laquelle un graphe est fourni (`west_coast_usa` aujourd'hui), le mod charge automatiquement son graphe et bascule **tout le trafic** (chaque véhicule sauf le tien) sur le pilotage complet maison — pas juste la vitesse. Lance le jeu, charge la carte, c'est tout. Ce comportement par défaut (`M.autoFullControlOnStart`) peut être désactivé sans relancer le jeu si besoin (`extensions.beamai_core.setAutoFullControlOnStart(false)` puis recharger la carte) pour retomber sur l'ancien pilotage vitesse-seule, plus prudent mais moins abouti.
 
 **Statut** :
-- ✅ **Validé en jeu (ancien système, vitesse seule)** : suivi de véhicule, respect des feux, bonne vitesse, puis contournement d'obstacle confirmé fonctionnel (appuyé sur l'évitement natif, aujourd'hui remplacé — voir plus bas).
-- 🔧 **Corrigé depuis (toujours sur l'ancien système), pas encore re-testé** : freinage tardif aux feux, hésitation en tournant à un carrefour, personnalités de conducteurs, performance (scan de segment "sticky") — voir Test 3.
-- 🆕🔴 **Pilotage complet maison — maintenant ACTIVÉ PAR DÉFAUT sur les cartes avec graphe embarqué, jamais validé en jeu jusqu'ici.** Le changement le plus risqué à ce jour, et le seul qui tourne désormais sans qu'on ait pu l'observer en conditions réelles au préalable : il n'y a plus aucun filet de sécurité natif une fois l'IA du jeu désactivée — si le calcul de direction est faux, rien ne rattrape le véhicule, pour tout le trafic à la fois. Un premier essai de test manuel n'avait en fait rien activé du tout (voir l'encadré du Test 5) ; le vrai premier test grandeur nature reste à faire — voir Test 5. L'évitement d'obstacle en pilotage complet est codé (décalage du point de visée du pure pursuit, plus de dépendance à l'évitement natif) mais désactivé par défaut (`setAvoidanceEnabled`) en attendant que le pilotage de base soit confirmé fiable. Reste non traité : choix de direction à un vrai carrefour (vise le carrefour lui-même plutôt que de deviner une branche).
+- ✅ **Validé en jeu — pilotage complet maison (direction + vitesse)** : confirmé par un vrai test grandeur nature, tout le trafic piloté par `steeringController.lua`/`speedController.lua`, plus aucune décision de `ai.lua`. C'est désormais le comportement par défaut.
+- ✅ **Validé en jeu — évitement d'obstacle en pilotage complet** : confirmé fonctionnel ("il esquive"). Un bug a ensuite été trouvé et corrigé : `isOffsetPathClear` incluait l'obstacle lui-même dans sa propre vérification de dégagement, ce qui faisait échouer la manœuvre (et donc freiner jusqu'à l'arrêt au lieu de contourner) dans la plupart des cas plutôt que de rater juste les cas vraiment bloqués — corrigé, pas encore re-testé en jeu depuis le correctif.
+- ✅ **Validé en jeu (ancien système, vitesse seule, avant le pilotage complet)** : suivi de véhicule, respect des feux, bonne vitesse, contournement d'obstacle via l'évitement natif (aujourd'hui remplacé).
+- 🔧 **Corrigé depuis (sur l'ancien système), jamais re-testé isolément** : freinage tardif aux feux, hésitation en tournant à un carrefour, performance (scan de segment "sticky") — plausiblement déjà couvert par le test grandeur nature du pilotage complet, sans confirmation dédiée.
+- 🆕 **Routage A\* (`router.lua`)** : calcule un itinéraire entre deux segments en respectant les sens uniques ; testé unitairement uniquement, **pas encore branché** sur le comportement des véhicules (aujourd'hui, aucun véhicule n'a de destination — `findLookaheadPoint` vise toujours le carrefour lui-même plutôt que de tourner). Prochaine étape.
 
 ### Tests automatisés (hors-jeu)
 

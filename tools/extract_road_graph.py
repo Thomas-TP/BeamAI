@@ -68,6 +68,12 @@ def load_decal_roads(zf: zipfile.ZipFile) -> list[dict]:
                     "sourceFile": info.filename,
                     "nodes": nodes,  # each node: [x, y, z, width]
                     "oneWay": bool(obj.get("oneWay", False)),
+                    # When oneWay is true, allowed travel is nodes[0]->nodes[-1] unless
+                    # flipDirection reverses it (BeamNG's own DecalRoad field, section 2.1
+                    # of the architecture doc) -- previously not captured at all, which
+                    # would have silently let a router treat a one-way street as
+                    # traversable in the wrong direction. Meaningless when oneWay is false.
+                    "flipDirection": bool(obj.get("flipDirection", False)),
                     "lanesLeft": obj.get("lanesLeft"),
                     "drivability": obj.get("drivability", 1),
                     "material": obj.get("material"),
