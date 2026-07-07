@@ -30,8 +30,12 @@ if ok then
   check("setEnabled is a function", type(core.setEnabled) == "function")
   check("registerVehicle is a function", type(core.registerVehicle) == "function")
   check("unregisterVehicle is a function", type(core.unregisterVehicle) == "function")
+  check("setFullControlEnabled is a function", type(core.setFullControlEnabled) == "function")
+  check("setAutoFullControlOnStart is a function", type(core.setAutoFullControlOnStart) == "function")
+  check("setAutoScanEnabled is a function", type(core.setAutoScanEnabled) == "function")
   check("onUpdate is a function", type(core.onUpdate) == "function")
   check("starts disabled", core.enabled == false)
+  check("full control defaults to on for auto-registered vehicles", core.autoFullControlOnStart == true)
 else
   print("  error: " .. tostring(core))
 end

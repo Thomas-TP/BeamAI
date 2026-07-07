@@ -34,10 +34,12 @@ Chaque appel à l'API du jeu a été vérifié directement dans le code source d
 
 **Changement de cap du projet** : ce mod ne s'appuie plus du tout sur le pilotage natif de BeamNG (`ai.setSpeed`, évitement natif). Il pilote directement le véhicule — direction, accélérateur, frein — via `input.event(...)`, le même canal bas niveau que `ai.lua` utilise lui-même en interne (`driveCar()`), avec `ai.setMode('disabled')` envoyé une fois pour que l'IA native cesse d'agir sur le véhicule. Le code source du jeu n'est plus utilisé que pour comprendre quels paramètres prendre en compte, pas comme moteur de décision.
 
+**Zéro commande console requise** : au chargement d'une carte pour laquelle un graphe est fourni (`west_coast_usa` aujourd'hui), le mod charge automatiquement son graphe et bascule **tout le trafic** (chaque véhicule sauf le tien) sur le pilotage complet maison — pas juste la vitesse. Lance le jeu, charge la carte, c'est tout. Ce comportement par défaut (`M.autoFullControlOnStart`) peut être désactivé sans relancer le jeu si besoin (`extensions.beamai_core.setAutoFullControlOnStart(false)` puis recharger la carte) pour retomber sur l'ancien pilotage vitesse-seule, plus prudent mais moins abouti.
+
 **Statut** :
-- ✅ **Validé en jeu** : suivi de véhicule (ancien système), respect des feux, bonne vitesse (premier playtest), puis contournement d'obstacle confirmé fonctionnel (avec l'ancien système appuyé sur l'évitement natif).
-- 🔧 **Corrigé depuis, pas encore re-testé** : freinage tardif aux feux, hésitation en tournant à un carrefour, personnalités de conducteurs, performance (scan de segment "sticky") — voir Test 3.
-- 🆕 **Pilotage complet maison (`setFullControlEnabled`) — jamais testé en jeu, le changement le plus risqué à ce jour.** Contrairement à tout ce qui précède, il n'y a plus aucun filet de sécurité natif une fois l'IA du jeu désactivée : si le calcul de direction est faux, rien ne rattrape le véhicule. Un premier essai de test n'a en fait rien activé du tout (voir l'encadré au début du Test 5) — encore à valider. Prévu justement pour être testé à part, à petite échelle — voir Test 5. L'évitement d'obstacle en pilotage complet est maintenant codé (décalage du point de visée du pure pursuit, plus de dépendance à l'évitement natif) mais pas encore testé en jeu non plus. Reste non traité : choix de direction à un vrai carrefour (vise le carrefour lui-même plutôt que de deviner une branche).
+- ✅ **Validé en jeu (ancien système, vitesse seule)** : suivi de véhicule, respect des feux, bonne vitesse, puis contournement d'obstacle confirmé fonctionnel (appuyé sur l'évitement natif, aujourd'hui remplacé — voir plus bas).
+- 🔧 **Corrigé depuis (toujours sur l'ancien système), pas encore re-testé** : freinage tardif aux feux, hésitation en tournant à un carrefour, personnalités de conducteurs, performance (scan de segment "sticky") — voir Test 3.
+- 🆕🔴 **Pilotage complet maison — maintenant ACTIVÉ PAR DÉFAUT sur les cartes avec graphe embarqué, jamais validé en jeu jusqu'ici.** Le changement le plus risqué à ce jour, et le seul qui tourne désormais sans qu'on ait pu l'observer en conditions réelles au préalable : il n'y a plus aucun filet de sécurité natif une fois l'IA du jeu désactivée — si le calcul de direction est faux, rien ne rattrape le véhicule, pour tout le trafic à la fois. Un premier essai de test manuel n'avait en fait rien activé du tout (voir l'encadré du Test 5) ; le vrai premier test grandeur nature reste à faire — voir Test 5. L'évitement d'obstacle en pilotage complet est codé (décalage du point de visée du pure pursuit, plus de dépendance à l'évitement natif) mais désactivé par défaut (`setAvoidanceEnabled`) en attendant que le pilotage de base soit confirmé fiable. Reste non traité : choix de direction à un vrai carrefour (vise le carrefour lui-même plutôt que de deviner une branche).
 
 ### Tests automatisés (hors-jeu)
 
@@ -91,33 +93,37 @@ extensions.beamai_core.setAvoidanceEnabled(true)
 - Le contourne-t-il visiblement (léger déplacement latéral) au lieu de rester bloqué ou de rentrer dedans ?
 - Toute erreur console au moment de la manœuvre (texte exact).
 
-### Test 5 — pilotage complet maison (nouveau, à tester avec beaucoup de prudence)
+### Test 5 — pilotage complet maison (maintenant automatique, premier vrai test en conditions réelles)
 
-**Ne teste pas ça en pleine circulation.** Sans l'IA native, un véhicule avec un mauvais calcul de direction pourrait sortir de la route ou percuter quelque chose — c'est exactement pour ça qu'il faut d'abord l'isoler.
+**Rien à taper.** Lance BeamNG.drive, charge **West Coast, USA**, attends quelques secondes que le trafic apparaisse. Depuis ce changement, tout ce trafic (hors ton propre véhicule) est piloté directement par `steeringController.lua`/`speedController.lua`, plus du tout par `ai.lua`. C'est le tout premier test en conditions réelles de ce pilotage — jamais observé en jeu avant ce test, seulement en simulation hors-jeu.
 
-**Piège découvert lors du premier essai — à ne pas refaire** : faire juste `extensions.reload("beamai_core")` puis `setFullControlEnabled(true)` **ne pilote rien du tout**. Le reload remet tout le module à zéro (`M.enabled=false`, `M.graph=nil`, aucun véhicule suivi) et `onClientStartMission` — le hook qui charge normalement le graphe et active tout automatiquement — ne se redéclenche **pas** juste parce que l'extension a été rechargée (il ne se déclenche qu'au vrai chargement d'un niveau). Résultat : `onUpdate` s'arrête à sa toute première ligne (`M.enabled` est faux), aucun véhicule n'a jamais reçu `ai.setMode('disabled')`, et ce qui roulait à l'écran était encore 100 % l'IA native du jeu. Il faut dérouler **toute** la séquence ci-dessous à chaque fois, après un reload.
+**Regarde en priorité, sur les premières minutes** :
+- Les véhicules restent-ils sur la route, ou certains partent-ils dans le décor ?
+- Braquent-ils du bon côté dans les virages, ou repartent-ils dans la direction opposée ? (si c'est inversé pour tout le monde à la fois, c'est un seul signe à changer dans `steeringController.lua`, `M.STEERING_SIGN` — un symptôme facile à reconnaître : ça part systématiquement du mauvais côté, pas aléatoirement)
+- La vitesse est-elle stable et fluide, ou ça oscille (accélère/freine sans cesse) ?
+- Toute erreur console (texte exact), surtout répétée.
 
-1. Choisis **un seul véhicule IA**, sur une route **droite et vide** si possible (une autoroute dégagée, ou une rue sans autre circulation ni carrefour proche)
-2. Note son ID (`local ids={};for i=0,be:getObjectCount()-1 do table.insert(ids,be:getObject(i):getID()) end;dump(ids)` puis identifie-le visuellement)
-3. Repars d'un état propre, puis désactive le re-scan automatique **avant** d'activer quoi que ce soit — sinon, dans les 3 secondes qui suivent `setEnabled(true)`, `onUpdate` embarque automatiquement tous les autres véhicules de la carte, et s'il voit déjà `fullControlEnabled=true`, il coupe aussi leur IA native à eux (pas seulement celle du véhicule visé) :
+**Si ça part mal** (sortie de route, comportement erratique généralisé) : `extensions.beamai_core.setEnabled(false)` dans la console coupe immédiatement ce mod pour tout le monde (recharge la carte ensuite pour que les véhicules déjà partis en pilotage maison retrouvent une IA native propre). Pour repartir sur l'ancien pilotage (vitesse seule, plus prudent, déjà validé en jeu) sans toucher au code : `extensions.beamai_core.setAutoFullControlOnStart(false)` puis recharge la carte.
+
+**Dis-moi** : ce que tu observes sur ces quatre points, et si possible depuis quelle distance/angle tu regardais (un véhicule vu de loin masque des petits écarts de trajectoire qu'on verrait de près).
+
+### Débogage isolé (un seul véhicule, si le Test 5 grandeur nature part mal)
+
+Si le test ci-dessus montre un problème et qu'il faut l'isoler sur un seul véhicule pour comprendre (ex. confirmer le sens de `STEERING_SIGN` calmement), repars d'un état propre et pilote la mise en route toi-même plutôt que de laisser l'automatique embarquer tout le monde :
+
 ```lua
 extensions.reload("beamai_core")
-extensions.beamai_core.setAutoScanEnabled(false)
+extensions.beamai_core.setAutoFullControlOnStart(false)  -- empêche l'automatique de reprendre la main
+extensions.beamai_core.setAutoScanEnabled(false)          -- empêche le re-scan (3s) d'embarquer tous les autres véhicules
 extensions.beamai_core.setGraphPath("lua/ge/extensions/beamai/data/west_coast_usa.roadgraph.json")
-extensions.beamai_core.registerVehicle(82723)
+extensions.beamai_core.registerVehicle(82723)             -- remplace par l'ID du véhicule isolé, choisi sur une route droite et vide
 extensions.beamai_core.setFullControlEnabled(true)
 extensions.beamai_core.setEnabled(true)
 ```
-4. Observe le véhicule pendant plusieurs secondes, à basse vitesse si possible
-5. Une fois le test terminé (concluant ou non) : `extensions.beamai_core.setEnabled(false)` pour tout arrêter proprement, puis `extensions.reload("beamai_core")` avant de repartir sur autre chose
 
-**Dis-moi précisément** :
-- Le véhicule reste-t-il sur la route, ou part-il dans le décor ? (si oui, arrête tout de suite : `extensions.beamai_core.setEnabled(false)`)
-- Braque-t-il du bon côté pour suivre la route, ou part-il dans la direction opposée ? (si c'est inversé, un seul signe à changer dans `steeringController.lua`, `M.STEERING_SIGN`)
-- La vitesse est-elle stable et fluide, ou oscille-t-elle (accélère/freine sans cesse) ?
-- Toute erreur console (texte exact).
+**Piège déjà rencontré, à ne pas refaire** : faire juste `extensions.reload("beamai_core")` puis `setFullControlEnabled(true)`, sans le reste, **ne pilote rien du tout**. `extensions.reload` remet le module à zéro (`M.enabled=false`, `M.graph=nil`) mais ne redéclenche pas `onClientStartMission` (qui ne se déclenche qu'au vrai chargement d'un niveau) — `onUpdate` s'arrête alors à sa toute première ligne et rien n'est jamais envoyé au véhicule. C'est ce qui s'est produit lors du tout premier essai : ce qui roulait à l'écran était encore 100 % l'IA native.
 
-Une fois ce premier test concluant, l'étape suivante est de réactiver `setAvoidanceEnabled(true)` avec un deuxième véhicule (ou un obstacle statique) pour valider le nouvel évitement d'obstacle en pilotage complet (voir plus bas) — mais seulement après avoir confirmé que le pilotage de base (direction + vitesse) est fiable tout seul.
+Une fois le pilotage de base confirmé fiable (à l'isolé ou en grandeur nature), l'étape suivante est `extensions.beamai_core.setAvoidanceEnabled(true)` pour valider l'évitement d'obstacle en pilotage complet (voir plus bas).
 
 ### Évitement d'obstacle en pilotage complet (nouveau, pas encore testé en jeu)
 

@@ -102,11 +102,24 @@
 -- and injects all three directly. This is the highest-risk change so far --
 -- unlike every previous increment, there is no native fallback/safety net
 -- once ai.setMode('disabled') has been sent, and steering an actual physics
--- vehicle wrong is a lot less forgiving than a wrong speed. OFF BY DEFAULT.
--- Test it in the most boring possible setting first (one vehicle, empty
--- straight road, low speed) before anything else -- see README.md.
+-- vehicle wrong is a lot less forgiving than a wrong speed.
 --
--- IMPORTANT lesson from the first attempt to test this: extensions.reload()
+-- ON BY DEFAULT for every vehicle on a bundled map (M.autoFullControlOnStart,
+-- applied from onClientStartMission below) -- explicit product decision: this
+-- mod's whole point is to replace BeamNG's traffic AI, so loading a supported
+-- map is meant to be enough on its own, no console commands required. This
+-- has NOT been validated in-game yet at the time this default was flipped on
+-- (only unit-tested). If traffic drives off-road, steers the wrong way, or
+-- behaves erratically after loading the map, the single fastest way back to
+-- normal is `extensions.beamai_core.setEnabled(false)` in the console (stops
+-- this mod from touching any vehicle further; already-disabled vehicles stay
+-- under our control but harmlessly idle -- reload the level to fully reset
+-- everyone back to native AI). To go back to the older, lower-risk
+-- ai.setSpeed-only path instead: `extensions.beamai_core.setAutoFullControlOnStart(false)`
+-- before loading/reloading the map. For a controlled single-vehicle test
+-- instead of every vehicle at once, see README.md Test 5.
+--
+-- IMPORTANT lesson from the first attempt to test this manually: extensions.reload()
 -- resets this module's state (M.enabled=false, M.graph=nil, no tracked
 -- vehicles) but does NOT re-fire onClientStartMission -- that hook only fires
 -- on an actual level load, not an extension reload. So calling
@@ -114,9 +127,8 @@
 -- does *nothing at all*: onUpdate's very first line returns immediately
 -- because M.enabled/M.graph are still unset, and no vehicle ever had
 -- ai.setMode('disabled') sent to it. Whatever driving was observed in that
--- state was still 100% native BeamNG AI. The full sequence (setGraphPath,
--- setEnabled, register the target vehicle, THEN setFullControlEnabled) must
--- be run every time after a reload -- see README.md Test 5.
+-- state was still 100% native BeamNG AI. Loading the map fresh (not just
+-- reloading the extension) is what actually exercises the default above.
 --
 -- Obstacle avoidance while in full control: implemented (updateFullControlAvoidance
 -- below) by offsetting our own pure-pursuit lookahead target sideways
@@ -150,6 +162,14 @@ M.enabled = false
 M.avoidanceEnabled = false
 M.fullControlEnabled = false
 M.autoScanEnabled = true
+-- Whether onClientStartMission switches straight to full custom control for
+-- every vehicle on a bundled map, with zero console commands needed. ON by
+-- default per explicit request: launching the game and loading a supported
+-- map (see BUNDLED_GRAPHS) is meant to be enough on its own. Flip to false
+-- with M.setAutoFullControlOnStart(false) to fall back to the older,
+-- lower-risk ai.setSpeed-only path (still real, still tested in-game, just
+-- doesn't touch steering) while diagnosing an issue.
+M.autoFullControlOnStart = true
 M.graph = nil
 -- vehId -> { profile, junctionDecision = {junctionId, obeys}, avoidanceState = <avoidance state> }
 local trackedVehicles = {}
@@ -211,6 +231,14 @@ function M.setAutoScanEnabled(value)
   M.autoScanEnabled = value and true or false
 end
 
+-- See M.autoFullControlOnStart above. Console override, e.g. to fall back to
+-- the legacy ai.setSpeed-only path without restarting the game:
+--   extensions.beamai_core.setAutoFullControlOnStart(false)
+--   extensions.beamai_core.setFullControlEnabled(false) -- if already on this session
+function M.setAutoFullControlOnStart(value)
+  M.autoFullControlOnStart = value and true or false
+end
+
 -- CONFIRMED against the actual installed game's source (lua/vehicle/ai.lua):
 -- ai.setSpeed(speed) takes ONLY the number -- the 'limit' vs 'set' vs 'legal'
 -- behaviour is a *separate* call, ai.setSpeedMode(mode), gating whether/how
@@ -270,10 +298,12 @@ function M.unregisterVehicle(vehId)
   trackedVehicles[vehId] = nil
 end
 
--- Opt-in switch for full custom control (own steering + own throttle/brake,
--- ai.lua's own driving disabled entirely) -- see the header comment above.
--- HIGHEST RISK setting in this mod: test with a single vehicle on an empty,
--- straight road at low speed before anything else.
+-- Switch for full custom control (own steering + own throttle/brake, ai.lua's
+-- own driving disabled entirely) -- see the header comment above. Applied
+-- automatically on map load by default (M.autoFullControlOnStart); this
+-- function is the manual override, e.g. to force it off mid-session
+-- (`setFullControlEnabled(false)`) or on for a specific vehicle registered by
+-- hand. HIGHEST RISK setting in this mod.
 function M.setFullControlEnabled(value)
   M.fullControlEnabled = value and true or false
   if M.fullControlEnabled then
@@ -498,7 +528,10 @@ function M.onClientStartMission(levelPath)
   end
   timeSinceLastScan = math.huge
   if M.setGraphPath(graphPath) then
-    M.setEnabled(true)
+    if M.autoFullControlOnStart then
+      M.setFullControlEnabled(true) -- flag only; applied per vehicle as registerAll picks each one up below
+    end
+    M.setEnabled(true) -- triggers onUpdate, which auto-registers every vehicle within REGISTER_SCAN_INTERVAL seconds
   end
 end
 
