@@ -394,13 +394,21 @@ local function updateAvoidance(vehState, ownVehId, ownObj, vehGap, vehLeaderSpee
   return vehGap, vehLeaderSpeed, false
 end
 
--- Plain list of {x,y,z} for every tracked vehicle except `ownVehId` --
--- the shape roadGraph.isOffsetPathClear expects. Only built when actually
--- about to check a maneuver (not every tick), since it's an O(n) allocation.
-local function buildOtherPositionsList(positionsById, ownVehId)
+-- Plain list of {x,y,z} for every tracked vehicle except `ownVehId` and
+-- `leaderVehId` -- the shape roadGraph.isOffsetPathClear expects. Excluding
+-- the leader is not optional: it's the very obstacle we're checking whether
+-- we can drive around, sitting almost exactly at the offset target point
+-- (roughly `gap` ahead, near-zero lateral offset from the lane centre) --
+-- left in, it is reliably closer than minClearance to BOTH candidate offset
+-- points, so isOffsetPathClear reports neither side clear and no maneuver
+-- ever starts (the same bug this project already hit and fixed once before,
+-- in the older ai.laneChange-based avoidance -- see docs/ARCHITECTURE.md
+-- section 10, point 10). Only built when actually about to check a maneuver
+-- (not every tick), since it's an O(n) allocation.
+local function buildOtherPositionsList(positionsById, ownVehId, leaderVehId)
   local list = {}
   for otherVehId, data in pairs(positionsById) do
-    if otherVehId ~= ownVehId then
+    if otherVehId ~= ownVehId and otherVehId ~= leaderVehId then
       table.insert(list, data.pos)
     end
   end
@@ -419,13 +427,13 @@ end
 -- this tick and the vehicle just keeps a safe IDM gap behind the obstacle
 -- until an opening appears. Same idle/offsetting/returning timing/hysteresis
 -- as the legacy path (avoidance.lua), reused unchanged.
-local function updateFullControlAvoidance(vehState, ownVehId, segment, ownProj, vehGap, vehLeaderSpeed, ownSpeed, dtSim, positionsById)
+local function updateFullControlAvoidance(vehState, ownVehId, leaderVehId, segment, ownProj, vehGap, vehLeaderSpeed, ownSpeed, dtSim, positionsById)
   local state = vehState.avoidanceState
   local wantsToAvoid = false
   local offsetSign = state.sign
 
   if state.phase == avoidance.IDLE and mobil.shouldAttemptObstacleAvoidance(vehGap, vehLeaderSpeed) then
-    local others = buildOtherPositionsList(positionsById, ownVehId)
+    local others = buildOtherPositionsList(positionsById, ownVehId, leaderVehId)
     local offsetM = AVOIDANCE_PARAMS.offsetMetres
     local maneuverM = AVOIDANCE_PARAMS.maneuverDistance
     if roadGraph.isOffsetPathClear(segment, ownProj, offsetM, maneuverM, others) then
@@ -585,7 +593,7 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     local segment, ownProj = roadGraph.findNearestSegmentNear(M.graph, data.pos, vehState.lastSegment)
     if segment and ownProj then
       vehState.lastSegment = segment
-      local vehGap, vehLeaderSpeed = findLeaderOnSegment(segment, vehId, ownProj, positionsById)
+      local vehGap, vehLeaderSpeed, vehLeaderId = findLeaderOnSegment(segment, vehId, ownProj, positionsById)
 
       -- Under full control there's no native side_avoidance left to nudge (it
       -- stopped running once ai.setMode('disabled') was sent), so avoidance
@@ -598,7 +606,7 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
       if M.avoidanceEnabled then
         if M.fullControlEnabled then
           vehGap, vehLeaderSpeed, isCreepingPastObstacle, lateralOffsetMetres = updateFullControlAvoidance(
-            vehState, vehId, segment, ownProj, vehGap, vehLeaderSpeed, data.speed, dtSim, positionsById)
+            vehState, vehId, vehLeaderId, segment, ownProj, vehGap, vehLeaderSpeed, data.speed, dtSim, positionsById)
         else
           vehGap, vehLeaderSpeed, isCreepingPastObstacle = updateAvoidance(
             vehState, vehId, data.obj, vehGap, vehLeaderSpeed, data.speed, dtSim)
