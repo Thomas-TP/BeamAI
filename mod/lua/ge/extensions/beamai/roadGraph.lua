@@ -84,6 +84,16 @@ function M.distanceAlong(nodes, fromPos, toPos)
   return cumulativeAt(toPos) - cumulativeAt(fromPos)
 end
 
+function M.normalize(v)
+  local len = vlen(v)
+  if len < 1e-9 then
+    return { 0, 0, 0 }
+  end
+  return { v[1] / len, v[2] / len, v[3] / len }
+end
+
+M.dot = vdot
+
 -- Normalized travel direction at a projection (as returned by
 -- closestPointOnPolyline): the direction of the polyline's sub-segment the
 -- projection falls on, in node order.
@@ -120,6 +130,56 @@ function M.findJunctionNear(graph, point, radius)
   return best
 end
 
+-- Looks ahead from `ownProj` (on `segment`) for the nearest upcoming
+-- trafficLight junction, transparently following "continuation" junctions
+-- (the same logical road split into consecutive DecalRoad pieces -- see
+-- tools/extract_road_graph.py classify_cluster) so a light several segments
+-- ahead is found early enough to brake comfortably, instead of only being
+-- noticed once the vehicle is on the final short segment leading into it.
+-- Stops looking (returns nil) at a real, unclassified junction -- turning
+-- there is a decision this v0 does not make (roadmap phase 2).
+--
+-- Returns junction, distanceToStopLine (metres from ownProj) or nil, nil.
+function M.findUpcomingTrafficLight(graph, segment, ownProj, maxLookahead, junctionRadius)
+  local distanceSoFar = M.segmentLength(segment.nodes) - ownProj.distanceAlong
+  local currentSeg = segment
+  local visited = { [segment.id] = true }
+
+  while distanceSoFar <= maxLookahead do
+    local endNode = currentSeg.nodes[#currentSeg.nodes]
+    local junction = M.findJunctionNear(graph, { endNode[1], endNode[2], endNode[3] }, junctionRadius)
+    if not junction then
+      return nil, nil
+    end
+    if junction.type == "trafficLight" then
+      return junction, distanceSoFar
+    end
+    if junction.type ~= "continuation" then
+      return nil, nil -- a real junction (or unclassified): phase-2 territory, stop here
+    end
+
+    local nextId = nil
+    for _, sid in ipairs(junction.approaches) do
+      if sid ~= currentSeg.id then
+        nextId = sid
+      end
+    end
+    if not nextId or visited[nextId] then
+      return nil, nil
+    end
+    visited[nextId] = true
+
+    local nextSeg = M.findSegmentById(graph, nextId)
+    if not nextSeg then
+      return nil, nil
+    end
+    distanceSoFar = distanceSoFar + M.segmentLength(nextSeg.nodes)
+    currentSeg = nextSeg
+  end
+
+  return nil, nil
+end
+
 function M.findSegmentById(graph, id)
   for _, seg in ipairs(graph.segments) do
     if seg.id == id then
@@ -140,6 +200,33 @@ function M.findNearestSegment(graph, point)
     end
   end
   return bestSeg, bestProj
+end
+
+local DEFAULT_MIN_SPEED_FOR_HEADING_CHECK = 1.0 -- m/s; below this, treat as a stationary obstacle regardless of heading
+local DEFAULT_MIN_HEADING_ALIGNMENT = 0.5 -- cos(60 deg): must be moving roughly the same way to count as "in our lane"
+
+-- Whether another vehicle projected at `otherProj` on `segment` is plausibly
+-- "ahead of us in our lane" rather than crossing traffic that merely happens
+-- to pass close to our polyline -- which is common right at intersections,
+-- where multiple segments' geometry converges within a few metres of each
+-- other. A vehicle nearly stopped (below minSpeedForHeadingCheck) is always
+-- considered a real obstacle regardless of heading, since a stopped/parked
+-- car blocking the lane must still be respected.
+function M.isPlausibleLeader(segment, otherProj, otherVel, otherSpeed, minSpeedForHeadingCheck, minHeadingAlignment)
+  minSpeedForHeadingCheck = minSpeedForHeadingCheck or DEFAULT_MIN_SPEED_FOR_HEADING_CHECK
+  minHeadingAlignment = minHeadingAlignment or DEFAULT_MIN_HEADING_ALIGNMENT
+
+  if otherProj.lateralOffset >= segment.width / 2 + 1 then
+    return false
+  end
+  if otherSpeed >= minSpeedForHeadingCheck then
+    local tangent = M.tangentAtProjection(segment.nodes, otherProj)
+    local otherHeading = M.normalize(otherVel)
+    if M.dot(tangent, otherHeading) < minHeadingAlignment then
+      return false -- likely crossing traffic near an intersection, not really ahead of us
+    end
+  end
+  return true
 end
 
 -- Loads a graph JSON file produced by tools/extract_road_graph.py.

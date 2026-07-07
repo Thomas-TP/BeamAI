@@ -103,6 +103,72 @@ do
   check("returns nil when out of radius", notFound == nil)
 end
 
+print("Test 7: findUpcomingTrafficLight follows continuations to find a light ahead")
+do
+  local segA = { id = "segA", nodes = { { 0, 0, 0, 3.5 }, { 50, 0, 0, 3.5 } } }
+  local segB = { id = "segB", nodes = { { 50, 0, 0, 3.5 }, { 100, 0, 0, 3.5 } } }
+  local segC = { id = "segC", nodes = { { 100, 0, 0, 3.5 }, { 150, 0, 0, 3.5 } } }
+  local graph = {
+    segments = { segA, segB, segC },
+    junctions = {
+      { id = "j1", type = "continuation", position = { 50, 0, 0 }, approaches = { "segA", "segB" } },
+      { id = "j2", type = "continuation", position = { 100, 0, 0 }, approaches = { "segB", "segC" } },
+      { id = "j3", type = "trafficLight", position = { 150, 0, 0 }, approaches = { "segC" } },
+    },
+  }
+  local ownProj = rg.closestPointOnPolyline(segA.nodes, { 10, 0, 0 }) -- 40m left on segA
+
+  local junction, dist = rg.findUpcomingTrafficLight(graph, segA, ownProj, 200, 6.0)
+  check("finds the light through two continuations", junction ~= nil and junction.id == "j3")
+  check("distance is 40 (rest of segA) + 50 (segB) + 50 (segC) = 140", near(dist, 140, 1e-6))
+
+  local junction2 = rg.findUpcomingTrafficLight(graph, segA, ownProj, 100, 6.0)
+  check("returns nil when the light is beyond maxLookahead", junction2 == nil)
+end
+
+print("Test 8: findUpcomingTrafficLight stops at a real (unclassified) junction")
+do
+  local segA = { id = "segA", nodes = { { 0, 0, 0, 3.5 }, { 50, 0, 0, 3.5 } } }
+  local segB = { id = "segB", nodes = { { 50, 0, 0, 3.5 }, { 100, 0, 0, 3.5 } } }
+  local segC = { id = "segC", nodes = { { 100, 0, 0, 3.5 }, { 150, 0, 0, 3.5 } } }
+  local graph = {
+    segments = { segA, segB, segC },
+    junctions = {
+      { id = "j1", type = "junction", position = { 50, 0, 0 }, approaches = { "segA", "segB" } },
+      { id = "j2", type = "trafficLight", position = { 100, 0, 0 }, approaches = { "segB", "segC" } },
+    },
+  }
+  local ownProj = rg.closestPointOnPolyline(segA.nodes, { 10, 0, 0 })
+  local junction = rg.findUpcomingTrafficLight(graph, segA, ownProj, 200, 6.0)
+  check("does not see the light past a real junction", junction == nil)
+end
+
+print("Test 9: normalize and dot")
+do
+  local n = rg.normalize({ 3, 4, 0 })
+  check("normalize({3,4,0}) has length 1", near(n[1], 0.6, 1e-6) and near(n[2], 0.8, 1e-6))
+  check("dot of perpendicular vectors is 0", near(rg.dot({ 1, 0, 0 }, { 0, 1, 0 }), 0, 1e-6))
+  check("dot of identical unit vectors is 1", near(rg.dot({ 1, 0, 0 }, { 1, 0, 0 }), 1, 1e-6))
+end
+
+print("Test 10: isPlausibleLeader filters out crossing traffic near intersections")
+do
+  local segment = { width = 3.5, nodes = { { 0, 0, 0, 3.5 }, { 100, 0, 0, 3.5 } } }
+  local otherProj = rg.closestPointOnPolyline(segment.nodes, { 60, 0.2, 0 }) -- almost dead-ahead, small lateral offset
+
+  check("same-direction moving vehicle ahead counts as a leader",
+    rg.isPlausibleLeader(segment, otherProj, { 10, 0, 0 }, 10) == true)
+
+  check("perpendicular-moving vehicle (crossing traffic) is filtered out",
+    rg.isPlausibleLeader(segment, otherProj, { 0, 10, 0 }, 10) == false)
+
+  check("a nearly stationary vehicle still counts regardless of heading",
+    rg.isPlausibleLeader(segment, otherProj, { 0, 0.5, 0 }, 0.3) == true)
+
+  check("a vehicle too far to the side is filtered out even if aligned",
+    rg.isPlausibleLeader(segment, rg.closestPointOnPolyline(segment.nodes, { 60, 5, 0 }), { 10, 0, 0 }, 10) == false)
+end
+
 print("Test 6: findSegmentById")
 do
   local graph = { segments = { { id = "a" }, { id = "b" } } }
