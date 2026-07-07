@@ -48,6 +48,30 @@
 -- unit tested; only the ai.laneChange dispatch itself is unverified. Test it
 -- in isolation first (one vehicle, one stationary obstacle, empty road) --
 -- see README.md -- before trusting it in full city traffic.
+--
+-- Second in-game playtest (West Coast USA, ~24 tracked vehicles) surfaced two
+-- more real bugs, both fixed here:
+--   4. Performance -- onUpdate rescanned every one of the graph's ~1300
+--      segments for every tracked vehicle on every single tick
+--      (roadGraph.findNearestSegment). Now uses findNearestSegmentNear, which
+--      checks the vehicle's segment from last tick first and only falls back
+--      to the full scan when that no longer fits.
+--   5. Avoidance never actually moved anything -- the console logged
+--      "beginning avoidance maneuver" but the vehicle stayed put. Root cause:
+--      the clearance check (isOffsetPathClear) included the very obstacle the
+--      maneuver exists to go around, which sits closer to the offset target
+--      (offsetMetres=2.2) than the clearance radius (minClearance=2.5) --
+--      so it always looked "not clear" and, depending on timing, could also
+--      silently block the ai.laneChange dispatch path. findLeaderOnSegment
+--      now also returns the leader's vehicle id so updateAvoidance can
+--      exclude it. Also newly excluded: the player's own vehicle is never
+--      registered/controlled (see registerAll) -- this mod should never send
+--      ai.setSpeed/ai.laneChange into a human-driven car.
+-- Still unconfirmed after fix #5: whether ai.laneChange has ANY visible
+-- effect at all in this game version/context (it silently no-ops if the
+-- vehicle has no active currentRoute.plan -- see lua/vehicle/ai.lua). If the
+-- vehicle still doesn't move after this fix, that is the next thing to check,
+-- isolated from all of this mod's own decision logic.
 
 -- Full path relative to lua/ge/extensions/ (confirmed convention: real shipped
 -- extensions always require siblings this way, e.g.
@@ -133,6 +157,7 @@ local function trackVehicle(vehId)
       profile = driverProfile.generate(),
       junctionDecision = { junctionId = nil, obeys = true },
       avoidanceState = avoidance.newState(),
+      lastSegment = nil, -- sticky hint for roadGraph.findNearestSegmentNear, set every tick in onUpdate
     }
   end
   initSpeedControl(vehId)
@@ -149,13 +174,18 @@ end
 -- Convenience for manual testing: registers every vehicle currently spawned in
 -- the level, so there is no need to hunt down individual vehicle IDs in the
 -- console. Call again after spawning more vehicles (or let onUpdate re-scan
--- automatically every REGISTER_SCAN_INTERVAL seconds).
+-- automatically every REGISTER_SCAN_INTERVAL seconds). Skips the player's own
+-- vehicle (be:getPlayerVehicle(0)) -- this mod should never send ai.setSpeed/
+-- ai.laneChange into a human-driven car.
 function M.registerAll()
+  local playerVeh = be:getPlayerVehicle(0)
+  local playerVehId = playerVeh and playerVeh:getID() or nil
+
   local n = be:getObjectCount()
   local count = 0
   for i = 0, n - 1 do
     local obj = be:getObject(i)
-    if obj then
+    if obj and obj:getID() ~= playerVehId then
       trackVehicle(obj:getID())
       count = count + 1
     end
@@ -186,14 +216,22 @@ end
 -- use for IDM: while a maneuver is in progress, the original obstacle is
 -- suppressed as a constraint (we're going around it, not stopping for it) --
 -- the traffic-light constraint is untouched and always still applies.
-local function updateAvoidance(vehState, segment, ownProj, positionsById, ownVehId, ownSpeed, vehGap, vehLeaderSpeed, dtSim)
+--
+-- vehLeaderId (the obstacle itself) is excluded from the clearance check:
+-- otherwise isOffsetPathClear always saw the obstacle we're trying to go
+-- around sitting right at the offset distance (offsetMetres, 2.2m) which is
+-- *closer* than its own clearance radius (minClearance, 2.5m default) and
+-- permanently refused to start the maneuver -- a real bug caught after the
+-- first in-game test showed "beginning avoidance maneuver" logged but no
+-- visible movement.
+local function updateAvoidance(vehState, segment, ownProj, positionsById, ownVehId, ownSpeed, vehGap, vehLeaderSpeed, vehLeaderId, dtSim)
   local state = vehState.avoidanceState
   local wantsToAvoid = false
 
   if state.phase == avoidance.IDLE and mobil.shouldAttemptObstacleAvoidance(vehGap, vehLeaderSpeed) then
     local otherPositions = {}
     for otherId, otherData in pairs(positionsById) do
-      if otherId ~= ownVehId then
+      if otherId ~= ownVehId and otherId ~= vehLeaderId then
         table.insert(otherPositions, otherData.pos)
       end
     end
@@ -221,8 +259,10 @@ end
 -- Finds the closest other tracked vehicle plausibly ahead of `ownProj` on the
 -- same segment (roadGraph.isPlausibleLeader filters out cross-traffic that
 -- merely passes close to our polyline near an intersection -- see header).
+-- Also returns that vehicle's id, so callers (updateAvoidance) can exclude
+-- the very obstacle they're trying to go around from their own clearance check.
 local function findLeaderOnSegment(segment, ownVehId, ownProj, positionsById)
-  local bestGap, bestSpeed = nil, nil
+  local bestGap, bestSpeed, bestVehId = nil, nil, nil
   for vehId in pairs(trackedVehicles) do
     if vehId ~= ownVehId then
       local otherPos = positionsById[vehId]
@@ -232,13 +272,13 @@ local function findLeaderOnSegment(segment, ownVehId, ownProj, positionsById)
           local gap = roadGraph.distanceAlong(segment.nodes, ownProj, otherProj)
           if gap > 0 and (bestGap == nil or gap < bestGap)
               and roadGraph.isPlausibleLeader(segment, otherProj, otherPos.vel, otherPos.speed) then
-            bestGap, bestSpeed = gap, otherPos.speed
+            bestGap, bestSpeed, bestVehId = gap, otherPos.speed, vehId
           end
         end
       end
     end
   end
-  return bestGap, bestSpeed
+  return bestGap, bestSpeed, bestVehId
 end
 
 -- Looks ahead (through continuation segments) for the nearest upcoming
@@ -339,14 +379,18 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
   end
 
   for vehId, data in pairs(positionsById) do
-    local segment, ownProj = roadGraph.findNearestSegment(M.graph, data.pos)
+    local vehState = trackedVehicles[vehId]
+    -- Sticky segment lookup: reuses last tick's segment when it still fits,
+    -- instead of rescanning all ~1300 segments per vehicle per tick (the
+    -- direct cause of an observed slowdown with ~24 tracked vehicles).
+    local segment, ownProj = roadGraph.findNearestSegmentNear(M.graph, data.pos, vehState.lastSegment)
     if segment and ownProj then
-      local vehState = trackedVehicles[vehId]
-      local vehGap, vehLeaderSpeed = findLeaderOnSegment(segment, vehId, ownProj, positionsById)
+      vehState.lastSegment = segment
+      local vehGap, vehLeaderSpeed, vehLeaderId = findLeaderOnSegment(segment, vehId, ownProj, positionsById)
 
       if M.avoidanceEnabled then
         vehGap, vehLeaderSpeed = updateAvoidance(
-          vehState, segment, ownProj, positionsById, vehId, data.speed, vehGap, vehLeaderSpeed, dtSim)
+          vehState, segment, ownProj, positionsById, vehId, data.speed, vehGap, vehLeaderSpeed, vehLeaderId, dtSim)
       end
 
       local lightGap = findStopLineConstraint(M.graph, segment, ownProj, vehState)

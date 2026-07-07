@@ -202,6 +202,24 @@ function M.findNearestSegment(graph, point)
   return bestSeg, bestProj
 end
 
+-- Same result as findNearestSegment, but checks `hintSegment` (typically the
+-- vehicle's segment from the previous tick) first and returns immediately if
+-- the point still projects onto it closely enough -- avoids rescanning every
+-- segment in the graph (hundreds to thousands of them) for every vehicle on
+-- every single tick, which is the dominant cost of core.lua's onUpdate and
+-- was the direct cause of an observed in-game performance drop with ~24
+-- tracked vehicles. Falls back to the full scan when there is no hint or the
+-- vehicle has left it (e.g. crossed into the next segment, or first tick).
+function M.findNearestSegmentNear(graph, point, hintSegment)
+  if hintSegment then
+    local proj = M.closestPointOnPolyline(hintSegment.nodes, point)
+    if proj and proj.lateralOffset <= (hintSegment.width / 2 + 2.0) then
+      return hintSegment, proj
+    end
+  end
+  return M.findNearestSegment(graph, point)
+end
+
 -- Perpendicular (horizontal-plane) direction at a projection, assuming a
 -- Z-up world (BeamNG convention): rotate the tangent 90 degrees around Z.
 -- The sign (which side is "left" vs "right") is not confirmed in-game yet --

@@ -203,6 +203,31 @@ do
   check("no other vehicles at all -> clear", rg.isOffsetPathClear(segment, ownProj, offset, 20.0, {}, 2.5) == true)
 end
 
+print("Test 13: findNearestSegmentNear reuses the hint without a full scan when it still fits")
+do
+  local perpNodes = {
+    { 25, 0, 0, 3.5 },
+    { 25, 50, 0, 3.5 },
+  }
+  local graph = {
+    segments = {
+      { id = "seg_straight", width = 3.5, nodes = straightNodes },
+      { id = "seg_perp", width = 3.5, nodes = perpNodes },
+    },
+  }
+  local seg, proj = rg.findNearestSegmentNear(graph, { 60, 0.5, 0 }, graph.segments[1])
+  check("stays on the hinted segment", seg.id == "seg_straight")
+  check("projection is still accurate", near(proj.distanceAlong, 60, 1e-6))
+
+  -- Point has moved somewhere the hint no longer covers -> falls back to a full scan.
+  local seg2 = rg.findNearestSegmentNear(graph, { 25, 20, 0 }, graph.segments[1])
+  check("falls back to the correct segment when the hint no longer fits", seg2.id == "seg_perp")
+
+  -- No hint at all -> behaves exactly like findNearestSegment.
+  local seg3 = rg.findNearestSegmentNear(graph, { 60, 0.5, 0 }, nil)
+  check("works with no hint", seg3.id == "seg_straight")
+end
+
 print("Test 6: findSegmentById")
 do
   local graph = { segments = { { id = "a" }, { id = "b" } } }
