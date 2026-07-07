@@ -29,49 +29,48 @@
 --      avoidance: a "reckless" driver still never intentionally rear-ends
 --      someone, it just may not stop for a light with nothing physically in
 --      the way.
--- Phase 3, first increment -- lateral obstacle avoidance (roadmap phase 3/4):
--- EXPERIMENTAL, OFF BY DEFAULT (see M.setAvoidanceEnabled). Unlike everything
--- above, this one physically displaces the vehicle sideways via ai.laneChange
--- -- confirmed to exist and be clamped to the road's own drivable width by the
--- game's source (lua/vehicle/ai.lua), so it cannot drive the vehicle off the
--- pavement, but two things are genuinely unverified in-game:
---   - which way is "left" vs "right" for the signed offset it's given (the
---     maneuver is internally consistent either way -- always the same side
---     relative to travel direction -- but which physical side that is has not
---     been observed yet; watch the first test and flip the hardcoded sign
---     argument (currently 1) passed to avoidance.update in updateAvoidance
---     below if it swerves the wrong way).
---   - whether the interaction with the ongoing IDM speed control (suppressed
---     for the original obstacle while a maneuver is in progress, see onUpdate)
---     actually reads as smooth driving rather than a lurch.
--- Decision logic (mobil.lua, avoidance.lua state machine) is pure and fully
--- unit tested; only the ai.laneChange dispatch itself is unverified. Test it
--- in isolation first (one vehicle, one stationary obstacle, empty road) --
--- see README.md -- before trusting it in full city traffic.
+-- Phase 3, first increment -- easing past a close, slow/stopped obstacle
+-- (roadmap phase 3/4). OFF BY DEFAULT (see M.setAvoidanceEnabled).
 --
 -- Second in-game playtest (West Coast USA, ~24 tracked vehicles) surfaced two
--- more real bugs, both fixed here:
+-- performance/correctness bugs (both fixed) and, more importantly, a design
+-- change after reading more of lua/vehicle/ai.lua:
 --   4. Performance -- onUpdate rescanned every one of the graph's ~1300
 --      segments for every tracked vehicle on every single tick
 --      (roadGraph.findNearestSegment). Now uses findNearestSegmentNear, which
 --      checks the vehicle's segment from last tick first and only falls back
 --      to the full scan when that no longer fits.
---   5. Avoidance never actually moved anything -- the console logged
---      "beginning avoidance maneuver" but the vehicle stayed put. Root cause:
---      the clearance check (isOffsetPathClear) included the very obstacle the
---      maneuver exists to go around, which sits closer to the offset target
---      (offsetMetres=2.2) than the clearance radius (minClearance=2.5) --
---      so it always looked "not clear" and, depending on timing, could also
---      silently block the ai.laneChange dispatch path. findLeaderOnSegment
---      now also returns the leader's vehicle id so updateAvoidance can
---      exclude it. Also newly excluded: the player's own vehicle is never
---      registered/controlled (see registerAll) -- this mod should never send
---      ai.setSpeed/ai.laneChange into a human-driven car.
--- Still unconfirmed after fix #5: whether ai.laneChange has ANY visible
--- effect at all in this game version/context (it silently no-ops if the
--- vehicle has no active currentRoute.plan -- see lua/vehicle/ai.lua). If the
--- vehicle still doesn't move after this fix, that is the next thing to check,
--- isolated from all of this mod's own decision logic.
+--   5. The player's own vehicle is now excluded from registerAll -- this mod
+--      should never send ai.setSpeed/ai.setParameters into a human-driven car.
+--   6. REDESIGNED the maneuver itself. The original approach manually called
+--      ai.laneChange to shift the vehicle sideways. Two things killed that
+--      idea: (a) tested directly in isolation (bypassing all of this mod's
+--      logic) it had no visible effect at all -- ai.laneChange operates on
+--      currentRoute.plan, and ai.lua explicitly clears currentRoute to nil
+--      "if stopped near player" (search that comment in ai.lua), which is
+--      exactly the test scenario (an AI vehicle stopped close to the player);
+--      (b) more fundamentally, lua/vehicle/ai.lua already has its own
+--      continuous, native side-avoidance (search "side_avoidance" and
+--      "trafficTable" in ai.lua): every tick, for every nearby vehicle with
+--      avoidCars == 'on' (the default whenever this mod doesn't touch
+--      ai.setMode, which it never does), it computes a lateral displacement
+--      to nudge around them and applies it to the live plan, clamped to the
+--      road's own width. Manually calling ai.laneChange on top of that is
+--      redundant at best and fights the native recompute at worst.
+--      So instead of computing our own lateral offset: when a close,
+--      slow/stopped obstacle is detected (mobil.shouldAttemptObstacleAvoidance),
+--      this mod (i) stops treating it as a hard IDM stop constraint so the
+--      vehicle can actually keep approaching instead of queuing up behind it
+--      forever, (ii) caps the speed to a cautious creep (CREEP_SPEED_MS) so it
+--      eases in rather than barrelling into a maneuver, and (iii) temporarily
+--      raises ai.lua's own awarenessForceCoef parameter (confirmed real,
+--      default 0.25, see lua/vehicle/ai.lua) so the native side-avoidance
+--      reacts more decisively at that lower speed, then restores the default
+--      once past. avoidance.lua's state machine (idle/offsetting/returning) is
+--      reused unchanged for the timing/hysteresis of this creep-and-boost
+--      window; only what core.lua *does* on each transition changed. Still
+--      unverified in-game: whether this actually produces a visibly smooth
+--      "goes around" rather than just "doesn't stop" -- see README.md.
 
 -- Full path relative to lua/ge/extensions/ (confirmed convention: real shipped
 -- extensions always require siblings this way, e.g.
@@ -100,6 +99,9 @@ local warnedNoLiveTrafficLightState = false
 local REGISTER_SCAN_INTERVAL = 3.0 -- seconds between automatic re-scans for newly spawned vehicles
 local timeSinceLastScan = math.huge -- forces an immediate scan on the first onUpdate
 local AVOIDANCE_PARAMS = avoidance.defaultParams
+local CREEP_SPEED_MS = 3.0 -- ~11 km/h; cautious speed while easing past a close obstacle
+local DEFAULT_AWARENESS_COEF = 0.25 -- lua/vehicle/ai.lua's own default for parameters.awarenessForceCoef
+local BOOSTED_AWARENESS_COEF = 1.0 -- more decisive native side-avoidance while easing past, at low speed
 
 -- Maps a level name (as returned by path.levelFromPath) to a bundled road
 -- graph shipped inside this mod, for fully automatic setup -- no console
@@ -201,59 +203,38 @@ local function dispatchSpeed(vehObj, speedMs)
   vehObj:queueLuaCommand(string.format("ai.setSpeed(%f)", speedMs))
 end
 
--- ai.laneChange(plan, dist, signedDisp) -- confirmed exported (lua/vehicle/ai.lua,
--- M.laneChange = laneChange), defaults `plan` to the vehicle's own currentRoute.plan
--- when passed nil, so it can be dispatched exactly like this from the outside.
--- EXPERIMENTAL -- see header comment.
-local function dispatchLaneChange(vehObj, signedOffset)
-  vehObj:queueLuaCommand(string.format("ai.laneChange(nil, %f, %f)", AVOIDANCE_PARAMS.maneuverDistance, signedOffset))
+-- ai.setParameters(data) -- confirmed exported (lua/vehicle/ai.lua). Used here
+-- only to dial the native side-avoidance's own responsiveness
+-- (parameters.awarenessForceCoef) up while easing past a close obstacle and
+-- back down to the default afterwards -- never to compute a trajectory
+-- ourselves (see header comment for why).
+local function dispatchAwareness(vehObj, coef)
+  vehObj:queueLuaCommand(string.format("ai.setParameters({awarenessForceCoef = %f})", coef))
 end
 
--- Runs the experimental avoidance state machine for one vehicle and performs
--- the ai.laneChange side effect the pure state machine (avoidance.lua) asks
--- for. distanceMovedThisTick is approximated as speed * dt (no extra position
--- history needed). Returns the (possibly nil'd out) vehGap/vehLeaderSpeed to
--- use for IDM: while a maneuver is in progress, the original obstacle is
--- suppressed as a constraint (we're going around it, not stopping for it) --
--- the traffic-light constraint is untouched and always still applies.
---
--- vehLeaderId (the obstacle itself) is excluded from the clearance check:
--- otherwise isOffsetPathClear always saw the obstacle we're trying to go
--- around sitting right at the offset distance (offsetMetres, 2.2m) which is
--- *closer* than its own clearance radius (minClearance, 2.5m default) and
--- permanently refused to start the maneuver -- a real bug caught after the
--- first in-game test showed "beginning avoidance maneuver" logged but no
--- visible movement.
-local function updateAvoidance(vehState, segment, ownProj, positionsById, ownVehId, ownSpeed, vehGap, vehLeaderSpeed, vehLeaderId, dtSim)
+-- Runs the creep-past state machine for one vehicle (avoidance.lua's state
+-- machine, reused for its timing/hysteresis only -- see header comment for
+-- why this no longer computes its own lateral offset). Returns the (possibly
+-- nil'd out) vehGap/vehLeaderSpeed for IDM, and whether the caller should cap
+-- the desired speed to a cautious creep while this is active.
+local function updateAvoidance(vehState, ownVehId, ownObj, vehGap, vehLeaderSpeed, ownSpeed, dtSim)
   local state = vehState.avoidanceState
-  local wantsToAvoid = false
-
-  if state.phase == avoidance.IDLE and mobil.shouldAttemptObstacleAvoidance(vehGap, vehLeaderSpeed) then
-    local otherPositions = {}
-    for otherId, otherData in pairs(positionsById) do
-      if otherId ~= ownVehId and otherId ~= vehLeaderId then
-        table.insert(otherPositions, otherData.pos)
-      end
-    end
-    wantsToAvoid = roadGraph.isOffsetPathClear(
-      segment, ownProj, AVOIDANCE_PARAMS.offsetMetres, AVOIDANCE_PARAMS.maneuverDistance, otherPositions)
-  end
+  local wantsToAvoid = state.phase == avoidance.IDLE and mobil.shouldAttemptObstacleAvoidance(vehGap, vehLeaderSpeed)
 
   local distanceMoved = ownSpeed * dtSim
   local action = avoidance.update(state, dtSim, distanceMoved, wantsToAvoid, 1, AVOIDANCE_PARAMS)
 
   if action == "beginOffset" then
-    log("I", "beamai_core", "vehicle " .. tostring(ownVehId) .. ": beginning avoidance maneuver")
-    dispatchLaneChange(positionsById[ownVehId].obj, AVOIDANCE_PARAMS.offsetMetres * state.sign)
+    log("I", "beamai_core", "vehicle " .. tostring(ownVehId) .. ": easing past a close, slow obstacle")
+    dispatchAwareness(ownObj, BOOSTED_AWARENESS_COEF)
   elseif action == "returnToCentre" then
-    log("I", "beamai_core", "vehicle " .. tostring(ownVehId) .. ": returning to lane centre")
-    dispatchLaneChange(positionsById[ownVehId].obj, -AVOIDANCE_PARAMS.offsetMetres * state.sign)
+    dispatchAwareness(ownObj, DEFAULT_AWARENESS_COEF)
   end
 
   if state.phase ~= avoidance.IDLE then
-    return nil, nil -- mid-maneuver: stop treating the original obstacle as a speed constraint
+    return nil, nil, true -- suppress the hard-stop constraint; caller applies a creep-speed cap instead
   end
-  return vehGap, vehLeaderSpeed
+  return vehGap, vehLeaderSpeed, false
 end
 
 -- Finds the closest other tracked vehicle plausibly ahead of `ownProj` on the
@@ -386,11 +367,12 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     local segment, ownProj = roadGraph.findNearestSegmentNear(M.graph, data.pos, vehState.lastSegment)
     if segment and ownProj then
       vehState.lastSegment = segment
-      local vehGap, vehLeaderSpeed, vehLeaderId = findLeaderOnSegment(segment, vehId, ownProj, positionsById)
+      local vehGap, vehLeaderSpeed = findLeaderOnSegment(segment, vehId, ownProj, positionsById)
 
+      local isCreepingPastObstacle = false
       if M.avoidanceEnabled then
-        vehGap, vehLeaderSpeed = updateAvoidance(
-          vehState, segment, ownProj, positionsById, vehId, data.speed, vehGap, vehLeaderSpeed, vehLeaderId, dtSim)
+        vehGap, vehLeaderSpeed, isCreepingPastObstacle = updateAvoidance(
+          vehState, vehId, data.obj, vehGap, vehLeaderSpeed, data.speed, dtSim)
       end
 
       local lightGap = findStopLineConstraint(M.graph, segment, ownProj, vehState)
@@ -408,6 +390,9 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
       local profile = vehState.profile
       local idmParams = driverProfile.applyIdmOverrides(idm.defaultParams, profile)
       idmParams.desiredSpeed = ((segment.speedLimit or 50) / 3.6) * profile.speedFactor
+      if isCreepingPastObstacle then
+        idmParams.desiredSpeed = math.min(idmParams.desiredSpeed, CREEP_SPEED_MS)
+      end
 
       local targetSpeed = idm.nextSpeed(data.speed, leaderSpeed or 0, gap, dtSim, idmParams)
       dispatchSpeed(data.obj, targetSpeed)
