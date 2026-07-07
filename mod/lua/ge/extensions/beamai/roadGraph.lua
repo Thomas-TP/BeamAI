@@ -116,6 +116,27 @@ function M.segmentLength(nodes)
   return total
 end
 
+-- The point at arc-length `targetDistance` along `nodes` (clamped to the
+-- polyline's own length if targetDistance overshoots). Used by the steering
+-- controller to find a lookahead point ahead of the vehicle along its path.
+function M.pointAtDistance(nodes, targetDistance)
+  if targetDistance <= 0 then
+    return { nodes[1][1], nodes[1][2], nodes[1][3] }
+  end
+  local cumulative = 0.0
+  for i = 1, #nodes - 1 do
+    local a, b = nodes[i], nodes[i + 1]
+    local segLen = vlen(vsub(b, a))
+    if cumulative + segLen >= targetDistance then
+      local t = segLen > 1e-9 and (targetDistance - cumulative) / segLen or 0
+      return { a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t, a[3] + (b[3] - a[3]) * t }
+    end
+    cumulative = cumulative + segLen
+  end
+  local last = nodes[#nodes]
+  return { last[1], last[2], last[3] }
+end
+
 -- Finds the closest junction to `point` within `radius` metres, or nil if none.
 -- Used to check whether a segment's far end (the direction of travel) leads
 -- into a signalized junction -- see core.lua.
@@ -178,6 +199,58 @@ function M.findUpcomingTrafficLight(graph, segment, ownProj, maxLookahead, junct
   end
 
   return nil, nil
+end
+
+-- The world-space point `lookaheadDistance` metres ahead of `ownProj` (on
+-- `segment`) along the path, for the pure-pursuit steering controller
+-- (steeringController.lua). Transparently crosses into the next segment
+-- through "continuation" junctions, same mechanism as findUpcomingTrafficLight.
+-- At a real junction (an actual choice of direction) or a dead end, aims at
+-- that point instead of guessing which way to turn -- turning decisions are
+-- roadmap phase 2; until then this is a safe, defined fallback rather than
+-- silently picking a branch.
+function M.findLookaheadPoint(graph, segment, ownProj, lookaheadDistance, junctionRadius)
+  local remainingOnSegment = M.segmentLength(segment.nodes) - ownProj.distanceAlong
+  if lookaheadDistance <= remainingOnSegment then
+    return M.pointAtDistance(segment.nodes, ownProj.distanceAlong + lookaheadDistance)
+  end
+
+  local distanceIntoNext = lookaheadDistance - remainingOnSegment
+  local currentSeg = segment
+  local visited = { [segment.id] = true }
+
+  while true do
+    local endNode = currentSeg.nodes[#currentSeg.nodes]
+    local endPos = { endNode[1], endNode[2], endNode[3] }
+    local junction = M.findJunctionNear(graph, endPos, junctionRadius)
+    if not junction then
+      return endPos -- dead end / edge of the mapped graph: aim at the last known point
+    end
+
+    local nextId = nil
+    if junction.type == "continuation" then
+      for _, sid in ipairs(junction.approaches) do
+        if sid ~= currentSeg.id then
+          nextId = sid
+        end
+      end
+    end
+    if not nextId or visited[nextId] then
+      return junction.position -- a real junction, or nothing left to follow: aim at it
+    end
+    visited[nextId] = true
+
+    local nextSeg = M.findSegmentById(graph, nextId)
+    if not nextSeg then
+      return endPos
+    end
+    local nextLen = M.segmentLength(nextSeg.nodes)
+    if distanceIntoNext <= nextLen then
+      return M.pointAtDistance(nextSeg.nodes, distanceIntoNext)
+    end
+    distanceIntoNext = distanceIntoNext - nextLen
+    currentSeg = nextSeg
+  end
 end
 
 function M.findSegmentById(graph, id)

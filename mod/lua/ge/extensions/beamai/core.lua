@@ -71,6 +71,46 @@
 --      window; only what core.lua *does* on each transition changed. Still
 --      unverified in-game: whether this actually produces a visibly smooth
 --      "goes around" rather than just "doesn't stop" -- see README.md.
+--
+-- Project direction change: build BeamAI's own complete driving stack rather
+-- than sit on top of BeamNG's native ai.lua (speed via ai.setSpeed, steering/
+-- path-following left entirely to the native system, obstacle avoidance
+-- leaning on native side_avoidance). ai.lua is now studied only to learn
+-- which real, confirmed low-level primitives exist (see below), not reused
+-- as the actual decision-maker.
+--
+-- Confirmed (lua/vehicle/ai.lua, lua/vehicle/input.lua, lua/common/inputFilters.lua):
+-- ai.lua's own final control step is
+--   input.event("steering", steering, "FILTER_AI", nil, nil, nil, "ai")
+--   input.event("throttle", throttle, "FILTER_AI", nil, nil, nil, "ai")
+--   input.event("brake", brake, "FILTER_AI", nil, nil, nil, "ai")
+-- (its `driveCar` function) -- a documented, stable, low-level input channel
+-- (FILTER_AI is a real constant, lua/common/inputFilters.lua) that we can
+-- drive directly with our own numbers, exactly as ai.lua itself does, instead
+-- of asking ai.lua to compute them for us.
+--
+-- M.setFullControlEnabled(true) switches tracked vehicles to this: on first
+-- tick under full control, ai.setMode('disabled') is sent once (ai.lua then
+-- stops calling driveCar() itself, per its own source -- "if M.mode ==
+-- 'disabled' then driveCar(0,0,0,0); M.updateGFX = nop", so it steps out of
+-- the way instead of fighting our injected inputs every tick). From then on,
+-- every tick this mod computes:
+--   - a lookahead point on our own road graph (roadGraph.findLookaheadPoint)
+--   - a steering command from it (steeringController.lua, pure-pursuit)
+--   - a target speed (idm.lua, unchanged) and throttle/brake to track it
+--     (speedController.lua, PID)
+-- and injects all three directly. This is the highest-risk change so far --
+-- unlike every previous increment, there is no native fallback/safety net
+-- once ai.setMode('disabled') has been sent, and steering an actual physics
+-- vehicle wrong is a lot less forgiving than a wrong speed. OFF BY DEFAULT.
+-- Test it in the most boring possible setting first (one vehicle, empty
+-- straight road, low speed) before anything else -- see README.md. Known
+-- gaps, not yet attempted: obstacle avoidance while in full control (the
+-- creep-and-boost trick above relied on native ai.lua, which is now disabled
+-- for these vehicles -- IDM still prevents a collision by slowing/stopping,
+-- but nothing yet steers around an obstacle in this mode), and turning
+-- decisions at real intersections (still phase 2, findLookaheadPoint aims at
+-- the junction itself rather than guessing a branch).
 
 -- Full path relative to lua/ge/extensions/ (confirmed convention: real shipped
 -- extensions always require siblings this way, e.g.
@@ -85,11 +125,14 @@ local trafficLights = require("beamai/trafficLights")
 local driverProfile = require("beamai/driverProfile")
 local mobil = require("beamai/mobil")
 local avoidance = require("beamai/avoidance")
+local steeringController = require("beamai/steeringController")
+local speedController = require("beamai/speedController")
 
 local M = {}
 
 M.enabled = false
 M.avoidanceEnabled = false
+M.fullControlEnabled = false
 M.graph = nil
 -- vehId -> { profile, junctionDecision = {junctionId, obeys}, avoidanceState = <avoidance state> }
 local trackedVehicles = {}
@@ -130,7 +173,9 @@ function M.setEnabled(value)
 end
 
 -- Opt-in switch for the experimental lateral avoidance maneuver -- see the
--- header comment above. Off by default even when M.enabled is on.
+-- header comment above. Off by default even when M.enabled is on. Has no
+-- effect on vehicles under full control (see M.setFullControlEnabled) --
+-- that mode doesn't use ai.lua's native side-avoidance at all.
 function M.setAvoidanceEnabled(value)
   M.avoidanceEnabled = value and true or false
 end
@@ -153,16 +198,37 @@ local function initSpeedControl(vehId)
   end
 end
 
+-- CONFIRMED (lua/vehicle/ai.lua): once mode is 'disabled', ai.lua zeroes the
+-- controls once and then sets its own M.updateGFX = nop -- it stops calling
+-- driveCar() every tick, i.e. it steps out of the way instead of continuing
+-- to fight whatever inputs we inject afterwards. This is what makes full
+-- custom control (see header comment) safe to attempt at all.
+local function setAiDisabled(vehId)
+  local obj = be:getObjectByID(vehId)
+  if obj then
+    obj:queueLuaCommand("ai.setMode('disabled')")
+  end
+end
+
 local function trackVehicle(vehId)
   if not trackedVehicles[vehId] then
     trackedVehicles[vehId] = {
       profile = driverProfile.generate(),
       junctionDecision = { junctionId = nil, obeys = true },
       avoidanceState = avoidance.newState(),
+      speedControllerState = speedController.newState(),
       lastSegment = nil, -- sticky hint for roadGraph.findNearestSegmentNear, set every tick in onUpdate
+      aiDisabled = false,
     }
   end
-  initSpeedControl(vehId)
+  if M.fullControlEnabled then
+    if not trackedVehicles[vehId].aiDisabled then
+      setAiDisabled(vehId)
+      trackedVehicles[vehId].aiDisabled = true
+    end
+  else
+    initSpeedControl(vehId)
+  end
 end
 
 function M.registerVehicle(vehId)
@@ -171,6 +237,22 @@ end
 
 function M.unregisterVehicle(vehId)
   trackedVehicles[vehId] = nil
+end
+
+-- Opt-in switch for full custom control (own steering + own throttle/brake,
+-- ai.lua's own driving disabled entirely) -- see the header comment above.
+-- HIGHEST RISK setting in this mod: test with a single vehicle on an empty,
+-- straight road at low speed before anything else.
+function M.setFullControlEnabled(value)
+  M.fullControlEnabled = value and true or false
+  if M.fullControlEnabled then
+    for vehId, vehState in pairs(trackedVehicles) do
+      if not vehState.aiDisabled then
+        setAiDisabled(vehId)
+        vehState.aiDisabled = true
+      end
+    end
+  end
 end
 
 -- Convenience for manual testing: registers every vehicle currently spawned in
@@ -198,9 +280,23 @@ end
 
 -- Sends a target speed (m/s) into vehId's own Vehicle Lua VM via its AI
 -- controller. Requires setSpeedMode('limit') to have been sent already
--- (see initSpeedControl above), otherwise ai.lua ignores routeSpeed.
+-- (see initSpeedControl above), otherwise ai.lua ignores routeSpeed. Only
+-- used for vehicles NOT under full control (see dispatchControls below).
 local function dispatchSpeed(vehObj, speedMs)
   vehObj:queueLuaCommand(string.format("ai.setSpeed(%f)", speedMs))
+end
+
+-- Full custom control: injects steering/throttle/brake directly, the same
+-- low-level channel ai.lua's own driveCar() uses (input.event with
+-- "FILTER_AI") -- confirmed in lua/vehicle/ai.lua and lua/vehicle/input.lua.
+-- Requires ai.setMode('disabled') to have been sent first (setAiDisabled)
+-- so ai.lua isn't also injecting its own values into the same channel.
+local function dispatchControls(vehObj, steeringVal, throttleVal, brakeVal)
+  vehObj:queueLuaCommand(string.format(
+    "input.event('steering', %f, 'FILTER_AI', nil, nil, nil, 'beamai'); " ..
+    "input.event('throttle', %f, 'FILTER_AI', nil, nil, nil, 'beamai'); " ..
+    "input.event('brake', %f, 'FILTER_AI', nil, nil, nil, 'beamai')",
+    steeringVal, throttleVal, brakeVal))
 end
 
 -- ai.setParameters(data) -- confirmed exported (lua/vehicle/ai.lua). Used here
@@ -342,17 +438,21 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     M.registerAll()
   end
 
-  -- Snapshot every tracked vehicle's position/velocity once per tick (avoids
-  -- re-querying the engine per-pair below).
+  -- Snapshot every tracked vehicle's position/velocity/heading once per tick
+  -- (avoids re-querying the engine per-pair below). getDirectionVector is the
+  -- vehicle's own forward heading, confirmed real (lua/ge/spawn.lua,
+  -- lua/ge/map.lua both call it on a vehicle object the same way).
   local positionsById = {}
   for vehId in pairs(trackedVehicles) do
     local obj = be:getObjectByID(vehId)
     if obj then
       local pos = obj:getPosition()
       local vel = obj:getVelocity()
+      local heading = obj:getDirectionVector()
       positionsById[vehId] = {
         pos = { pos.x, pos.y, pos.z },
         vel = { vel.x, vel.y, vel.z },
+        heading = { heading.x, heading.y, heading.z },
         speed = math.sqrt(vel.x * vel.x + vel.y * vel.y + vel.z * vel.z),
         obj = obj,
       }
@@ -369,8 +469,13 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
       vehState.lastSegment = segment
       local vehGap, vehLeaderSpeed = findLeaderOnSegment(segment, vehId, ownProj, positionsById)
 
+      -- The native-avoidance creep-and-boost trick (updateAvoidance) relies on
+      -- ai.lua's own side_avoidance, which no longer runs once a vehicle is
+      -- under full control (ai.setMode('disabled')) -- skip it there. IDM
+      -- below still prevents a collision either way; full control just can't
+      -- steer around the obstacle yet (see header comment, known gap).
       local isCreepingPastObstacle = false
-      if M.avoidanceEnabled then
+      if M.avoidanceEnabled and not M.fullControlEnabled then
         vehGap, vehLeaderSpeed, isCreepingPastObstacle = updateAvoidance(
           vehState, vehId, data.obj, vehGap, vehLeaderSpeed, data.speed, dtSim)
       end
@@ -395,7 +500,16 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
       end
 
       local targetSpeed = idm.nextSpeed(data.speed, leaderSpeed or 0, gap, dtSim, idmParams)
-      dispatchSpeed(data.obj, targetSpeed)
+
+      if M.fullControlEnabled then
+        local lookahead = steeringController.lookaheadDistance(data.speed)
+        local target = roadGraph.findLookaheadPoint(M.graph, segment, ownProj, lookahead, JUNCTION_SEARCH_RADIUS)
+        local steeringVal = steeringController.computeSteering(data.pos, data.heading, target)
+        local throttleVal, brakeVal = speedController.compute(vehState.speedControllerState, data.speed, targetSpeed, dtSim)
+        dispatchControls(data.obj, steeringVal, throttleVal, brakeVal)
+      else
+        dispatchSpeed(data.obj, targetSpeed)
+      end
     end
   end
 end

@@ -228,6 +228,60 @@ do
   check("works with no hint", seg3.id == "seg_straight")
 end
 
+print("Test 14: pointAtDistance")
+do
+  local p0 = rg.pointAtDistance(straightNodes, 0)
+  check("distance 0 -> first node", near(p0[1], 0, 1e-6) and near(p0[2], 0, 1e-6))
+  local p30 = rg.pointAtDistance(straightNodes, 30)
+  check("distance 30 -> (30,0,0)", near(p30[1], 30, 1e-6) and near(p30[2], 0, 1e-6))
+  local pEnd = rg.pointAtDistance(straightNodes, 500) -- overshoots the 100m polyline
+  check("overshooting distance clamps to the last node", near(pEnd[1], 100, 1e-6))
+end
+
+print("Test 15: findLookaheadPoint stays on the current segment when it fits")
+do
+  local segA = { id = "segA", nodes = { { 0, 0, 0, 3.5 }, { 100, 0, 0, 3.5 } } }
+  local graph = { segments = { segA }, junctions = {} }
+  local ownProj = rg.closestPointOnPolyline(segA.nodes, { 10, 0, 0 })
+  local pt = rg.findLookaheadPoint(graph, segA, ownProj, 15.0, 6.0)
+  check("lookahead point is 15m ahead on the same segment", near(pt[1], 25, 1e-6))
+end
+
+print("Test 16: findLookaheadPoint crosses into the next segment through a continuation")
+do
+  local segA = { id = "segA", nodes = { { 0, 0, 0, 3.5 }, { 50, 0, 0, 3.5 } } }
+  local segB = { id = "segB", nodes = { { 50, 0, 0, 3.5 }, { 100, 0, 0, 3.5 } } }
+  local graph = {
+    segments = { segA, segB },
+    junctions = { { id = "j1", type = "continuation", position = { 50, 0, 0 }, approaches = { "segA", "segB" } } },
+  }
+  local ownProj = rg.closestPointOnPolyline(segA.nodes, { 40, 0, 0 }) -- 10m left on segA
+  local pt = rg.findLookaheadPoint(graph, segA, ownProj, 25.0, 6.0) -- needs 15m into segB
+  check("lookahead point lands 15m into segB (x=65)", near(pt[1], 65, 1e-6))
+end
+
+print("Test 17: findLookaheadPoint aims at a real junction instead of guessing a branch")
+do
+  local segA = { id = "segA", nodes = { { 0, 0, 0, 3.5 }, { 50, 0, 0, 3.5 } } }
+  local segB = { id = "segB", nodes = { { 50, 0, 0, 3.5 }, { 100, 0, 0, 3.5 } } }
+  local graph = {
+    segments = { segA, segB },
+    junctions = { { id = "j1", type = "junction", position = { 50, 0, 0 }, approaches = { "segA", "segB" } } },
+  }
+  local ownProj = rg.closestPointOnPolyline(segA.nodes, { 40, 0, 0 })
+  local pt = rg.findLookaheadPoint(graph, segA, ownProj, 25.0, 6.0)
+  check("aims at the junction position, does not cross into segB", near(pt[1], 50, 1e-6))
+end
+
+print("Test 18: findLookaheadPoint aims at the road's end when the graph runs out")
+do
+  local segA = { id = "segA", nodes = { { 0, 0, 0, 3.5 }, { 50, 0, 0, 3.5 } } }
+  local graph = { segments = { segA }, junctions = {} }
+  local ownProj = rg.closestPointOnPolyline(segA.nodes, { 40, 0, 0 })
+  local pt = rg.findLookaheadPoint(graph, segA, ownProj, 25.0, 6.0)
+  check("aims at the dead end (x=50)", near(pt[1], 50, 1e-6))
+end
+
 print("Test 6: findSegmentById")
 do
   local graph = { segments = { { id = "a" }, { id = "b" } } }

@@ -25,19 +25,23 @@ Le mod lui-même (Game Engine Lua) :
 - `driverProfile.lua` — personnalité par véhicule (vitesse, distance de suivi, non-respect occasionnel des feux)
 - `mobil.lua` — décision de contournement (inspiré MOBIL) : détecte un obstacle proche et quasi à l'arrêt
 - `avoidance.lua` — machine à états (idle → contournement → retour) qui gère la durée/l'hystérésis du contournement, pure et testée
+- `steeringController.lua` — **contrôleur de direction maison** (pure pursuit) : calcule l'angle de braquage à partir de la position/cap/vitesse du véhicule et d'un point de visée sur notre propre graphe routier
+- `speedController.lua` — **contrôleur de vitesse maison** (PID) : convertit une vitesse cible en accélérateur/frein
 - `core.lua` — orchestrateur : au chargement d'une carte pour laquelle un graphe est fourni, charge le graphe et enregistre automatiquement tous les véhicules (et re-scanne toutes les 3s) — aucune commande console requise pour la partie validée
 - `data/west_coast_usa.roadgraph.json` — graphe pré-généré, embarqué dans le mod
 
-Chaque appel à l'API du jeu a été vérifié directement dans le code source du jeu installé (`lua/ge/ge_utils.lua`, `lua/ge/extensions/core/vehicles.lua`, `lua/vehicle/ai.lua`, `lua/ge/extensions/core/trafficSignals.lua`) — ce ne sont pas des suppositions.
+Chaque appel à l'API du jeu a été vérifié directement dans le code source du jeu installé (`lua/ge/ge_utils.lua`, `lua/ge/extensions/core/vehicles.lua`, `lua/vehicle/ai.lua`, `lua/vehicle/input.lua`, `lua/common/inputFilters.lua`, `lua/ge/extensions/core/trafficSignals.lua`) — ce ne sont pas des suppositions.
+
+**Changement de cap du projet** : ce mod ne s'appuie plus du tout sur le pilotage natif de BeamNG (`ai.setSpeed`, évitement natif). Il pilote directement le véhicule — direction, accélérateur, frein — via `input.event(...)`, le même canal bas niveau que `ai.lua` utilise lui-même en interne (`driveCar()`), avec `ai.setMode('disabled')` envoyé une fois pour que l'IA native cesse d'agir sur le véhicule. Le code source du jeu n'est plus utilisé que pour comprendre quels paramètres prendre en compte, pas comme moteur de décision.
 
 **Statut** :
-- ✅ **Validé en jeu** : suivi de véhicule, respect des feux, bonne vitesse (premier playtest).
-- 🔧 **Corrigé depuis, pas encore re-testé** : freinage tardif aux feux, hésitation en tournant à un carrefour, personnalités de conducteurs, performance (scan de segment "sticky") — voir Test 3 ci-dessous.
-- 🔁 **Contournement d'obstacle — redesigné après un test qui n'a rien donné.** Premier essai : calculer nous-mêmes un décalage latéral via `ai.laneChange`. Résultat : rien ne bougeait, même en appelant `ai.laneChange` directement, hors de toute logique du mod. En creusant `lua/vehicle/ai.lua`, deux explications : (1) `ai.laneChange` a besoin d'une route active (`currentRoute.plan`) que le jeu vide explicitement quand un véhicule est à l'arrêt près du joueur — exactement le scénario testé ; (2) surtout, **le jeu a déjà son propre évitement latéral natif et continu** (`side_avoidance`, actif dès que `avoidCars='on'`, ce qui est le cas par défaut tant qu'on ne touche pas au mode IA — ce que ce mod ne fait jamais). Nouvelle approche, plus simple et plus fiable : ce mod ne calcule plus de trajectoire, il (1) arrête de traiter l'obstacle comme un arrêt dur pour que le véhicule continue d'avancer, (2) plafonne sa vitesse à une allure prudente (~11 km/h), et (3) augmente temporairement la réactivité de l'évitement natif du jeu (`ai.setParameters({awarenessForceCoef=...})`, confirmé réel) pour qu'il contourne proprement à cette vitesse réduite. Toujours désactivé par défaut — voir Test 4.
+- ✅ **Validé en jeu** : suivi de véhicule (ancien système), respect des feux, bonne vitesse (premier playtest), puis contournement d'obstacle confirmé fonctionnel (avec l'ancien système appuyé sur l'évitement natif).
+- 🔧 **Corrigé depuis, pas encore re-testé** : freinage tardif aux feux, hésitation en tournant à un carrefour, personnalités de conducteurs, performance (scan de segment "sticky") — voir Test 3.
+- 🆕 **Pilotage complet maison (`setFullControlEnabled`) — jamais testé en jeu, le changement le plus risqué à ce jour.** Contrairement à tout ce qui précède, il n'y a plus aucun filet de sécurité natif une fois l'IA du jeu désactivée : si le calcul de direction est faux, rien ne rattrape le véhicule. Prévu justement pour être testé à part, à petite échelle — voir Test 5. Connu comme non traité pour l'instant : contournement d'obstacle en pilotage complet (le véhicule ralentit/s'arrête via IDM mais ne braque pas encore autour) et choix de direction à un vrai carrefour (vise le carrefour lui-même plutôt que de deviner une branche).
 
 ### Tests automatisés (hors-jeu)
 
-`idm.lua`, `roadGraph.lua`, `trafficLights.lua`, `driverProfile.lua`, `mobil.lua` et `avoidance.lua` sont du Lua pur (aucune dépendance BeamNG) et testés unitairement avec un interpréteur Lua 5.4 standalone. `core.lua` a un test de fumée qui vérifie qu'il se charge sans erreur de syntaxe et que ses dépendances se résolvent.
+`idm.lua`, `roadGraph.lua`, `trafficLights.lua`, `driverProfile.lua`, `mobil.lua`, `avoidance.lua`, `steeringController.lua` et `speedController.lua` sont du Lua pur (aucune dépendance BeamNG) et testés unitairement avec un interpréteur Lua 5.4 standalone — y compris une simulation en boucle fermée qui vérifie que le PID converge réellement vers la vitesse cible. `core.lua` a un test de fumée qui vérifie qu'il se charge sans erreur de syntaxe et que ses dépendances se résolvent.
 ```
 lua tests/lua/test_idm.lua
 lua tests/lua/test_roadGraph.lua
@@ -45,6 +49,8 @@ lua tests/lua/test_trafficLights.lua
 lua tests/lua/test_driverProfile.lua
 lua tests/lua/test_mobil.lua
 lua tests/lua/test_avoidance.lua
+lua tests/lua/test_steeringController.lua
+lua tests/lua/test_speedController.lua
 lua tests/lua/test_core_smoke.lua
 ```
 Tous passent actuellement.
@@ -84,6 +90,32 @@ extensions.beamai_core.setAvoidanceEnabled(true)
 - Le véhicule ralentit-il à une allure prudente puis continue-t-il à avancer au lieu de s'arrêter net derrière l'obstacle ?
 - Le contourne-t-il visiblement (léger déplacement latéral) au lieu de rester bloqué ou de rentrer dedans ?
 - Toute erreur console au moment de la manœuvre (texte exact).
+
+### Test 5 — pilotage complet maison (nouveau, à tester avec beaucoup de prudence)
+
+**Ne teste pas ça en pleine circulation.** Sans l'IA native, un véhicule avec un mauvais calcul de direction pourrait sortir de la route ou percuter quelque chose — c'est exactement pour ça qu'il faut d'abord l'isoler.
+
+1. Choisis **un seul véhicule IA**, sur une route **droite et vide** si possible (une autoroute dégagée, ou une rue sans autre circulation ni carrefour proche)
+2. Note son ID (`local ids={};for i=0,be:getObjectCount()-1 do table.insert(ids,be:getObject(i):getID()) end;dump(ids)` puis identifie-le visuellement)
+3. Enregistre uniquement ce véhicule puis active le pilotage complet **seulement pour lui** — mais `setFullControlEnabled` s'applique à tous les véhicules déjà suivis, donc le plus sûr est de désactiver d'abord le suivi général, ne garder que ce véhicule, puis activer :
+```lua
+extensions.beamai_core.setEnabled(false)
+extensions.beamai_core.unregisterVehicle(82723)
+```
+   (répète `unregisterVehicle` pour vider la liste, ou redémarre le mod avec `extensions.reload("beamai_core")` pour repartir propre, puis)
+```lua
+extensions.beamai_core.setGraphPath("lua/ge/extensions/beamai/data/west_coast_usa.roadgraph.json")
+extensions.beamai_core.registerVehicle(82723)
+extensions.beamai_core.setEnabled(true)
+extensions.beamai_core.setFullControlEnabled(true)
+```
+4. Observe le véhicule pendant plusieurs secondes, à basse vitesse si possible
+
+**Dis-moi précisément** :
+- Le véhicule reste-t-il sur la route, ou part-il dans le décor ? (si oui, arrête tout de suite : `extensions.beamai_core.setFullControlEnabled(false)` puis remets-le en mode normal)
+- Braque-t-il du bon côté pour suivre la route, ou part-il dans la direction opposée ? (si c'est inversé, un seul signe à changer dans `steeringController.lua`, `M.STEERING_SIGN`)
+- La vitesse est-elle stable et fluide, ou oscille-t-elle (accélère/freine sans cesse) ?
+- Toute erreur console (texte exact).
 
 ### Regénérer le graphe embarqué (rare, seulement si `tools/extract_road_graph.py` change)
 
