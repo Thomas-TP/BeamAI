@@ -74,6 +74,36 @@ do
   check("timeout returns returnToCentre at some point", sawReturnToCentre == true)
 end
 
+print("Test 5: currentOffsetMetres ramps in/out smoothly instead of stepping")
+do
+  local params = { offsetMetres = 2.2, maneuverDistance = 20.0, holdDistance = 15.0, maxDuration = 15.0, rampDistance = 5.0 }
+  local s = avoidance.newState()
+  check("idle -> zero offset", avoidance.currentOffsetMetres(s, params) == 0)
+
+  avoidance.update(s, 0.1, 0, true, 1, params) -- begin offsetting, sign=1
+  local earlyOffset = avoidance.currentOffsetMetres(s, params)
+  check("just started offsetting -> near zero, not a step to full magnitude", earlyOffset < 0.5)
+
+  avoidance.update(s, 0.1, 5.0, false, 1, params) -- fully into the ramp distance (5m)
+  local rampedOffset = avoidance.currentOffsetMetres(s, params)
+  check("past the ramp distance -> at full magnitude", math.abs(rampedOffset - 2.2) < 1e-6)
+
+  avoidance.update(s, 0.1, 10.0, false, 1, params) -- total 15m -> crosses into returning
+  check("now returning", s.phase == avoidance.RETURNING)
+  local justReturningOffset = avoidance.currentOffsetMetres(s, params)
+  check("just crossed into returning -> still near full magnitude (continuous, no jump)",
+    math.abs(justReturningOffset - 2.2) < 1e-6)
+
+  avoidance.update(s, 0.1, 5.0, false, 1, params) -- 5m into the return ramp
+  local midReturnOffset = avoidance.currentOffsetMetres(s, params)
+  check("mid return ramp -> back down to ~zero", math.abs(midReturnOffset) < 1e-6)
+
+  local sNeg = avoidance.newState()
+  avoidance.update(sNeg, 0.1, 0, true, -1, params)
+  avoidance.update(sNeg, 0.1, 5.0, false, -1, params)
+  check("negative sign offsets the other way", avoidance.currentOffsetMetres(sNeg, params) < 0)
+end
+
 print("")
 if failures == 0 then
   print("ALL TESTS PASSED")

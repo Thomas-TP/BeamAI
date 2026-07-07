@@ -13,10 +13,11 @@ M.OFFSETTING = "offsetting"
 M.RETURNING = "returning"
 
 M.defaultParams = {
-  offsetMetres = 2.2,      -- lateral shift requested from ai.laneChange
+  offsetMetres = 2.2,      -- lateral shift requested from ai.laneChange / the full-control steering target
   maneuverDistance = 20.0, -- metres the ai.laneChange ramp is applied over
   holdDistance = 15.0,     -- metres travelled while offset before starting to return
   maxDuration = 15.0,      -- seconds; hard safety timeout back to centre no matter what
+  rampDistance = 5.0,      -- metres over which currentOffsetMetres eases in/out, avoiding a steering step
 }
 
 function M.newState()
@@ -61,6 +62,30 @@ function M.update(state, dt, distanceMovedThisTick, wantsToAvoid, offsetSign, pa
   end
 
   return nil
+end
+
+-- Continuous signed lateral offset (metres) for the *current* state, eased in
+-- and out over params.rampDistance instead of stepping straight to
+-- offsetMetres -- used by the full-control path (core.lua) to bend the
+-- pure-pursuit lookahead target sideways smoothly, tick by tick. Call after
+-- M.update() so state reflects this tick's phase/distanceTravelled already.
+-- Pure function of state, no side effects.
+function M.currentOffsetMetres(state, params)
+  params = params or M.defaultParams
+  local ramp = params.rampDistance or 5.0
+
+  if state.phase == M.OFFSETTING then
+    local t = ramp > 1e-9 and math.min(state.distanceTravelled / ramp, 1.0) or 1.0
+    return state.sign * params.offsetMetres * t
+  end
+
+  if state.phase == M.RETURNING then
+    local distanceIntoReturn = state.distanceTravelled - params.holdDistance
+    local t = ramp > 1e-9 and math.max(1.0 - distanceIntoReturn / ramp, 0.0) or 0.0
+    return state.sign * params.offsetMetres * t
+  end
+
+  return 0
 end
 
 return M

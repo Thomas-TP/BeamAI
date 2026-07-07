@@ -24,7 +24,7 @@ Le mod lui-même (Game Engine Lua) :
 - `trafficLights.lua` — lecture de l'état d'un feu ; **échoue en sécurité** (un état illisible est traité comme rouge, jamais comme vert)
 - `driverProfile.lua` — personnalité par véhicule (vitesse, distance de suivi, non-respect occasionnel des feux)
 - `mobil.lua` — décision de contournement (inspiré MOBIL) : détecte un obstacle proche et quasi à l'arrêt
-- `avoidance.lua` — machine à états (idle → contournement → retour) qui gère la durée/l'hystérésis du contournement, pure et testée
+- `avoidance.lua` — machine à états (idle → contournement → retour) qui gère la durée/l'hystérésis du contournement, plus un décalage latéral continu et progressif (`currentOffsetMetres`) utilisé en pilotage complet ; pure et testée
 - `steeringController.lua` — **contrôleur de direction maison** (pure pursuit) : calcule l'angle de braquage à partir de la position/cap/vitesse du véhicule et d'un point de visée sur notre propre graphe routier
 - `speedController.lua` — **contrôleur de vitesse maison** (PID) : convertit une vitesse cible en accélérateur/frein
 - `core.lua` — orchestrateur : au chargement d'une carte pour laquelle un graphe est fourni, charge le graphe et enregistre automatiquement tous les véhicules (et re-scanne toutes les 3s) — aucune commande console requise pour la partie validée
@@ -37,7 +37,7 @@ Chaque appel à l'API du jeu a été vérifié directement dans le code source d
 **Statut** :
 - ✅ **Validé en jeu** : suivi de véhicule (ancien système), respect des feux, bonne vitesse (premier playtest), puis contournement d'obstacle confirmé fonctionnel (avec l'ancien système appuyé sur l'évitement natif).
 - 🔧 **Corrigé depuis, pas encore re-testé** : freinage tardif aux feux, hésitation en tournant à un carrefour, personnalités de conducteurs, performance (scan de segment "sticky") — voir Test 3.
-- 🆕 **Pilotage complet maison (`setFullControlEnabled`) — jamais testé en jeu, le changement le plus risqué à ce jour.** Contrairement à tout ce qui précède, il n'y a plus aucun filet de sécurité natif une fois l'IA du jeu désactivée : si le calcul de direction est faux, rien ne rattrape le véhicule. Prévu justement pour être testé à part, à petite échelle — voir Test 5. Connu comme non traité pour l'instant : contournement d'obstacle en pilotage complet (le véhicule ralentit/s'arrête via IDM mais ne braque pas encore autour) et choix de direction à un vrai carrefour (vise le carrefour lui-même plutôt que de deviner une branche).
+- 🆕 **Pilotage complet maison (`setFullControlEnabled`) — jamais testé en jeu, le changement le plus risqué à ce jour.** Contrairement à tout ce qui précède, il n'y a plus aucun filet de sécurité natif une fois l'IA du jeu désactivée : si le calcul de direction est faux, rien ne rattrape le véhicule. Un premier essai de test n'a en fait rien activé du tout (voir l'encadré au début du Test 5) — encore à valider. Prévu justement pour être testé à part, à petite échelle — voir Test 5. L'évitement d'obstacle en pilotage complet est maintenant codé (décalage du point de visée du pure pursuit, plus de dépendance à l'évitement natif) mais pas encore testé en jeu non plus. Reste non traité : choix de direction à un vrai carrefour (vise le carrefour lui-même plutôt que de deviner une branche).
 
 ### Tests automatisés (hors-jeu)
 
@@ -95,27 +95,33 @@ extensions.beamai_core.setAvoidanceEnabled(true)
 
 **Ne teste pas ça en pleine circulation.** Sans l'IA native, un véhicule avec un mauvais calcul de direction pourrait sortir de la route ou percuter quelque chose — c'est exactement pour ça qu'il faut d'abord l'isoler.
 
+**Piège découvert lors du premier essai — à ne pas refaire** : faire juste `extensions.reload("beamai_core")` puis `setFullControlEnabled(true)` **ne pilote rien du tout**. Le reload remet tout le module à zéro (`M.enabled=false`, `M.graph=nil`, aucun véhicule suivi) et `onClientStartMission` — le hook qui charge normalement le graphe et active tout automatiquement — ne se redéclenche **pas** juste parce que l'extension a été rechargée (il ne se déclenche qu'au vrai chargement d'un niveau). Résultat : `onUpdate` s'arrête à sa toute première ligne (`M.enabled` est faux), aucun véhicule n'a jamais reçu `ai.setMode('disabled')`, et ce qui roulait à l'écran était encore 100 % l'IA native du jeu. Il faut dérouler **toute** la séquence ci-dessous à chaque fois, après un reload.
+
 1. Choisis **un seul véhicule IA**, sur une route **droite et vide** si possible (une autoroute dégagée, ou une rue sans autre circulation ni carrefour proche)
 2. Note son ID (`local ids={};for i=0,be:getObjectCount()-1 do table.insert(ids,be:getObject(i):getID()) end;dump(ids)` puis identifie-le visuellement)
-3. Enregistre uniquement ce véhicule puis active le pilotage complet **seulement pour lui** — mais `setFullControlEnabled` s'applique à tous les véhicules déjà suivis, donc le plus sûr est de désactiver d'abord le suivi général, ne garder que ce véhicule, puis activer :
+3. Repars d'un état propre, puis désactive le re-scan automatique **avant** d'activer quoi que ce soit — sinon, dans les 3 secondes qui suivent `setEnabled(true)`, `onUpdate` embarque automatiquement tous les autres véhicules de la carte, et s'il voit déjà `fullControlEnabled=true`, il coupe aussi leur IA native à eux (pas seulement celle du véhicule visé) :
 ```lua
-extensions.beamai_core.setEnabled(false)
-extensions.beamai_core.unregisterVehicle(82723)
-```
-   (répète `unregisterVehicle` pour vider la liste, ou redémarre le mod avec `extensions.reload("beamai_core")` pour repartir propre, puis)
-```lua
+extensions.reload("beamai_core")
+extensions.beamai_core.setAutoScanEnabled(false)
 extensions.beamai_core.setGraphPath("lua/ge/extensions/beamai/data/west_coast_usa.roadgraph.json")
 extensions.beamai_core.registerVehicle(82723)
-extensions.beamai_core.setEnabled(true)
 extensions.beamai_core.setFullControlEnabled(true)
+extensions.beamai_core.setEnabled(true)
 ```
 4. Observe le véhicule pendant plusieurs secondes, à basse vitesse si possible
+5. Une fois le test terminé (concluant ou non) : `extensions.beamai_core.setEnabled(false)` pour tout arrêter proprement, puis `extensions.reload("beamai_core")` avant de repartir sur autre chose
 
 **Dis-moi précisément** :
-- Le véhicule reste-t-il sur la route, ou part-il dans le décor ? (si oui, arrête tout de suite : `extensions.beamai_core.setFullControlEnabled(false)` puis remets-le en mode normal)
+- Le véhicule reste-t-il sur la route, ou part-il dans le décor ? (si oui, arrête tout de suite : `extensions.beamai_core.setEnabled(false)`)
 - Braque-t-il du bon côté pour suivre la route, ou part-il dans la direction opposée ? (si c'est inversé, un seul signe à changer dans `steeringController.lua`, `M.STEERING_SIGN`)
 - La vitesse est-elle stable et fluide, ou oscille-t-elle (accélère/freine sans cesse) ?
 - Toute erreur console (texte exact).
+
+Une fois ce premier test concluant, l'étape suivante est de réactiver `setAvoidanceEnabled(true)` avec un deuxième véhicule (ou un obstacle statique) pour valider le nouvel évitement d'obstacle en pilotage complet (voir plus bas) — mais seulement après avoir confirmé que le pilotage de base (direction + vitesse) est fiable tout seul.
+
+### Évitement d'obstacle en pilotage complet (nouveau, pas encore testé en jeu)
+
+Depuis ce changement, l'évitement en pilotage complet **ne s'appuie plus du tout sur l'évitement natif** (impossible de toute façon, puisque `ai.lua` est désactivé) : quand un obstacle proche et quasi à l'arrêt est détecté (`mobil.shouldAttemptObstacleAvoidance`), le mod vérifie quel côté (gauche ou droite) est réellement dégagé des autres véhicules suivis (`roadGraph.isOffsetPathClear`) puis décale progressivement le point de visée du pure pursuit vers ce côté (`avoidance.currentOffsetMetres`, une transition en douceur plutôt qu'un saut brutal) le temps du dépassement, avant de le ramener au centre. Si aucun des deux côtés n'est dégagé, le véhicule ne tente rien ce tick-là et se contente de garder une distance de sécurité via IDM — il retentera au tick suivant. Activable via `extensions.beamai_core.setAvoidanceEnabled(true)` (déjà utilisé par le Test 4, mais avec un comportement différent selon que `fullControlEnabled` est actif ou non). Validé uniquement par tests unitaires à ce stade.
 
 ### Regénérer le graphe embarqué (rare, seulement si `tools/extract_road_graph.py` change)
 

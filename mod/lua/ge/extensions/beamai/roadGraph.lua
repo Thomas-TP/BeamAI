@@ -302,6 +302,19 @@ function M.lateralDirectionAtProjection(nodes, proj)
   return M.normalize({ -t[2], t[1], 0 })
 end
 
+-- Shifts `point` {x,y,z} sideways by `metres` along `lateralDir` (a unit
+-- vector, typically from lateralDirectionAtProjection). Used to bend the
+-- pure-pursuit lookahead target sideways for the full-control obstacle
+-- avoidance maneuver (core.lua) -- the car steers toward a laterally-shifted
+-- point instead of the raw path centreline.
+function M.offsetPointLateral(point, lateralDir, metres)
+  return {
+    point[1] + lateralDir[1] * metres,
+    point[2] + lateralDir[2] * metres,
+    point[3] + lateralDir[3] * metres,
+  }
+end
+
 -- Checks whether shifting `lateralOffset` metres sideways from `ownProj`, over
 -- the next `maneuverDistance` metres of travel, would come within
 -- `minClearance` of any position in `otherPositions` (list of {x,y,z}) --

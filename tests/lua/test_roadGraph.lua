@@ -289,6 +289,16 @@ do
   check("returns nil for missing id", rg.findSegmentById(graph, "zzz") == nil)
 end
 
+print("Test 19: offsetPointLateral")
+do
+  local pt = rg.offsetPointLateral({ 10, 20, 0 }, { 0, 1, 0 }, 2.5)
+  check("shifts along the lateral direction", near(pt[1], 10, 1e-6) and near(pt[2], 22.5, 1e-6) and near(pt[3], 0, 1e-6))
+  local ptNeg = rg.offsetPointLateral({ 10, 20, 0 }, { 0, 1, 0 }, -2.5)
+  check("negative metres shifts the other way", near(ptNeg[2], 17.5, 1e-6))
+  local ptZero = rg.offsetPointLateral({ 10, 20, 0 }, { 1, 0, 0 }, 0)
+  check("zero metres leaves the point unchanged", near(ptZero[1], 10, 1e-6) and near(ptZero[2], 20, 1e-6))
+end
+
 print("")
 if failures == 0 then
   print("ALL TESTS PASSED")

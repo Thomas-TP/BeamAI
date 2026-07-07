@@ -104,13 +104,29 @@
 -- once ai.setMode('disabled') has been sent, and steering an actual physics
 -- vehicle wrong is a lot less forgiving than a wrong speed. OFF BY DEFAULT.
 -- Test it in the most boring possible setting first (one vehicle, empty
--- straight road, low speed) before anything else -- see README.md. Known
--- gaps, not yet attempted: obstacle avoidance while in full control (the
--- creep-and-boost trick above relied on native ai.lua, which is now disabled
--- for these vehicles -- IDM still prevents a collision by slowing/stopping,
--- but nothing yet steers around an obstacle in this mode), and turning
--- decisions at real intersections (still phase 2, findLookaheadPoint aims at
--- the junction itself rather than guessing a branch).
+-- straight road, low speed) before anything else -- see README.md.
+--
+-- IMPORTANT lesson from the first attempt to test this: extensions.reload()
+-- resets this module's state (M.enabled=false, M.graph=nil, no tracked
+-- vehicles) but does NOT re-fire onClientStartMission -- that hook only fires
+-- on an actual level load, not an extension reload. So calling
+-- setFullControlEnabled(true) right after a reload, with nothing else set up,
+-- does *nothing at all*: onUpdate's very first line returns immediately
+-- because M.enabled/M.graph are still unset, and no vehicle ever had
+-- ai.setMode('disabled') sent to it. Whatever driving was observed in that
+-- state was still 100% native BeamNG AI. The full sequence (setGraphPath,
+-- setEnabled, register the target vehicle, THEN setFullControlEnabled) must
+-- be run every time after a reload -- see README.md Test 5.
+--
+-- Obstacle avoidance while in full control: implemented (updateFullControlAvoidance
+-- below) by offsetting our own pure-pursuit lookahead target sideways
+-- (roadGraph.offsetPointLateral) instead of nudging native side-avoidance,
+-- which doesn't run anymore once ai.setMode('disabled') has been sent. The
+-- side is chosen by checking which offset direction is actually clear of
+-- other tracked vehicles right now (roadGraph.isOffsetPathClear). Not yet
+-- tested in-game (blocked on full control itself being validated first).
+-- Turning decisions at real intersections remain phase 2 (findLookaheadPoint
+-- aims at the junction itself rather than guessing a branch).
 
 -- Full path relative to lua/ge/extensions/ (confirmed convention: real shipped
 -- extensions always require siblings this way, e.g.
@@ -133,6 +149,7 @@ local M = {}
 M.enabled = false
 M.avoidanceEnabled = false
 M.fullControlEnabled = false
+M.autoScanEnabled = true
 M.graph = nil
 -- vehId -> { profile, junctionDecision = {junctionId, obeys}, avoidanceState = <avoidance state> }
 local trackedVehicles = {}
@@ -172,12 +189,26 @@ function M.setEnabled(value)
   M.enabled = value and true or false
 end
 
--- Opt-in switch for the experimental lateral avoidance maneuver -- see the
--- header comment above. Off by default even when M.enabled is on. Has no
--- effect on vehicles under full control (see M.setFullControlEnabled) --
--- that mode doesn't use ai.lua's native side-avoidance at all.
+-- Opt-in switch for the lateral avoidance maneuver -- see the header comment
+-- above. Off by default even when M.enabled is on. Under full control (see
+-- M.setFullControlEnabled), this drives a lateral offset of our own
+-- pure-pursuit lookahead target (updateFullControlAvoidance) instead of
+-- nudging ai.lua's native side-avoidance, which isn't running anymore once
+-- ai.setMode('disabled') has been sent.
 function M.setAvoidanceEnabled(value)
   M.avoidanceEnabled = value and true or false
+end
+
+-- Opt-in switch for the periodic auto re-scan (every REGISTER_SCAN_INTERVAL
+-- seconds, see onUpdate) that picks up newly spawned vehicles by calling
+-- registerAll(). ON by default for normal play. Turn OFF before an isolated
+-- single-vehicle test (README.md Test 5): otherwise the very next onUpdate
+-- tick after M.setEnabled(true) sweeps in every other vehicle on the map too
+-- -- including, if M.fullControlEnabled is already on, disabling their native
+-- AI as well. registerVehicle/registerAll still work manually while this is
+-- off; only the automatic timer is affected.
+function M.setAutoScanEnabled(value)
+  M.autoScanEnabled = value and true or false
 end
 
 -- CONFIRMED against the actual installed game's source (lua/vehicle/ai.lua):
@@ -333,6 +364,58 @@ local function updateAvoidance(vehState, ownVehId, ownObj, vehGap, vehLeaderSpee
   return vehGap, vehLeaderSpeed, false
 end
 
+-- Plain list of {x,y,z} for every tracked vehicle except `ownVehId` --
+-- the shape roadGraph.isOffsetPathClear expects. Only built when actually
+-- about to check a maneuver (not every tick), since it's an O(n) allocation.
+local function buildOtherPositionsList(positionsById, ownVehId)
+  local list = {}
+  for otherVehId, data in pairs(positionsById) do
+    if otherVehId ~= ownVehId then
+      table.insert(list, data.pos)
+    end
+  end
+  return list
+end
+
+-- Full-control equivalent of updateAvoidance (below): there is no native
+-- side-avoidance to nudge anymore once ai.setMode('disabled') has been sent,
+-- so this instead drives a continuous signed lateral offset (metres) of our
+-- own pure-pursuit lookahead point (roadGraph.offsetPointLateral, applied by
+-- the caller) -- the car steers toward a laterally-shifted target rather than
+-- the raw path centreline. The side (left/right) is chosen only once, at the
+-- moment the maneuver starts, by checking which offset direction is actually
+-- clear of the other tracked vehicles right now (roadGraph.isOffsetPathClear,
+-- unit tested standalone); if neither side is clear yet, no maneuver starts
+-- this tick and the vehicle just keeps a safe IDM gap behind the obstacle
+-- until an opening appears. Same idle/offsetting/returning timing/hysteresis
+-- as the legacy path (avoidance.lua), reused unchanged.
+local function updateFullControlAvoidance(vehState, ownVehId, segment, ownProj, vehGap, vehLeaderSpeed, ownSpeed, dtSim, positionsById)
+  local state = vehState.avoidanceState
+  local wantsToAvoid = false
+  local offsetSign = state.sign
+
+  if state.phase == avoidance.IDLE and mobil.shouldAttemptObstacleAvoidance(vehGap, vehLeaderSpeed) then
+    local others = buildOtherPositionsList(positionsById, ownVehId)
+    local offsetM = AVOIDANCE_PARAMS.offsetMetres
+    local maneuverM = AVOIDANCE_PARAMS.maneuverDistance
+    if roadGraph.isOffsetPathClear(segment, ownProj, offsetM, maneuverM, others) then
+      wantsToAvoid, offsetSign = true, 1
+    elseif roadGraph.isOffsetPathClear(segment, ownProj, -offsetM, maneuverM, others) then
+      wantsToAvoid, offsetSign = true, -1
+    end
+    -- else: neither side clear right now -- stay idle, IDM keeps a safe gap and we retry next tick
+  end
+
+  local distanceMoved = ownSpeed * dtSim
+  avoidance.update(state, dtSim, distanceMoved, wantsToAvoid, offsetSign, AVOIDANCE_PARAMS)
+  local lateralOffsetMetres = avoidance.currentOffsetMetres(state, AVOIDANCE_PARAMS)
+
+  if state.phase ~= avoidance.IDLE then
+    return nil, nil, true, lateralOffsetMetres -- suppress the hard-stop constraint; caller applies a creep-speed cap instead
+  end
+  return vehGap, vehLeaderSpeed, false, lateralOffsetMetres
+end
+
 -- Finds the closest other tracked vehicle plausibly ahead of `ownProj` on the
 -- same segment (roadGraph.isPlausibleLeader filters out cross-traffic that
 -- merely passes close to our polyline near an intersection -- see header).
@@ -432,10 +515,12 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
 
   -- Automatically pick up newly spawned/despawned vehicles every few seconds,
   -- so nobody has to call registerAll() by hand after spawning traffic.
-  timeSinceLastScan = timeSinceLastScan + dtSim
-  if timeSinceLastScan >= REGISTER_SCAN_INTERVAL then
-    timeSinceLastScan = 0
-    M.registerAll()
+  if M.autoScanEnabled then
+    timeSinceLastScan = timeSinceLastScan + dtSim
+    if timeSinceLastScan >= REGISTER_SCAN_INTERVAL then
+      timeSinceLastScan = 0
+      M.registerAll()
+    end
   end
 
   -- Snapshot every tracked vehicle's position/velocity/heading once per tick
@@ -469,15 +554,22 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
       vehState.lastSegment = segment
       local vehGap, vehLeaderSpeed = findLeaderOnSegment(segment, vehId, ownProj, positionsById)
 
-      -- The native-avoidance creep-and-boost trick (updateAvoidance) relies on
-      -- ai.lua's own side_avoidance, which no longer runs once a vehicle is
-      -- under full control (ai.setMode('disabled')) -- skip it there. IDM
-      -- below still prevents a collision either way; full control just can't
-      -- steer around the obstacle yet (see header comment, known gap).
+      -- Under full control there's no native side_avoidance left to nudge (it
+      -- stopped running once ai.setMode('disabled') was sent), so avoidance
+      -- there instead offsets our own steering target laterally
+      -- (updateFullControlAvoidance). The legacy path (updateAvoidance) still
+      -- boosts ai.lua's native awarenessForceCoef, only for vehicles NOT under
+      -- full control.
       local isCreepingPastObstacle = false
-      if M.avoidanceEnabled and not M.fullControlEnabled then
-        vehGap, vehLeaderSpeed, isCreepingPastObstacle = updateAvoidance(
-          vehState, vehId, data.obj, vehGap, vehLeaderSpeed, data.speed, dtSim)
+      local lateralOffsetMetres = 0
+      if M.avoidanceEnabled then
+        if M.fullControlEnabled then
+          vehGap, vehLeaderSpeed, isCreepingPastObstacle, lateralOffsetMetres = updateFullControlAvoidance(
+            vehState, vehId, segment, ownProj, vehGap, vehLeaderSpeed, data.speed, dtSim, positionsById)
+        else
+          vehGap, vehLeaderSpeed, isCreepingPastObstacle = updateAvoidance(
+            vehState, vehId, data.obj, vehGap, vehLeaderSpeed, data.speed, dtSim)
+        end
       end
 
       local lightGap = findStopLineConstraint(M.graph, segment, ownProj, vehState)
@@ -504,6 +596,10 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
       if M.fullControlEnabled then
         local lookahead = steeringController.lookaheadDistance(data.speed)
         local target = roadGraph.findLookaheadPoint(M.graph, segment, ownProj, lookahead, JUNCTION_SEARCH_RADIUS)
+        if lateralOffsetMetres ~= 0 then
+          local lateralDir = roadGraph.lateralDirectionAtProjection(segment.nodes, ownProj)
+          target = roadGraph.offsetPointLateral(target, lateralDir, lateralOffsetMetres)
+        end
         local steeringVal = steeringController.computeSteering(data.pos, data.heading, target)
         local throttleVal, brakeVal = speedController.compute(vehState.speedControllerState, data.speed, targetSpeed, dtSim)
         dispatchControls(data.obj, steeringVal, throttleVal, brakeVal)
