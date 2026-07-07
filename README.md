@@ -27,7 +27,7 @@ Le mod lui-même (Game Engine Lua) :
 - `avoidance.lua` — machine à états (idle → contournement → retour) qui gère la durée/l'hystérésis du contournement, plus un décalage latéral continu et progressif (`currentOffsetMetres`) utilisé en pilotage complet ; pure et testée
 - `steeringController.lua` — **contrôleur de direction maison** (pure pursuit) : calcule l'angle de braquage à partir de la position/cap/vitesse du véhicule et d'un point de visée sur notre propre graphe routier
 - `speedController.lua` — **contrôleur de vitesse maison** (PID) : convertit une vitesse cible en accélérateur/frein
-- `router.lua` — **routage A\*** sur le graphe de segments : calcule un itinéraire entre un segment de départ et un segment de destination, en respectant les sens uniques (`oneWay`/`flipDirection`) ; nouveau, testé unitairement (8 scénarios), **pas encore branché sur le comportement des véhicules** — voir Statut
+- `router.lua` — **routage A\*** sur le graphe de segments : calcule un itinéraire entre un segment de départ et un segment de destination, en respectant les sens uniques (`oneWay`/`flipDirection`) ; branché sur `core.lua` (destination aléatoire par véhicule, suivie à travers les vrais carrefours), testé unitairement (15 scénarios), **pas encore observé en jeu** — voir Statut
 - `core.lua` — orchestrateur : au chargement d'une carte pour laquelle un graphe est fourni, charge le graphe et enregistre automatiquement tous les véhicules (et re-scanne toutes les 3s) — aucune commande console requise pour la partie validée
 - `data/west_coast_usa.roadgraph.json` — graphe pré-généré, embarqué dans le mod
 
@@ -42,7 +42,7 @@ Chaque appel à l'API du jeu a été vérifié directement dans le code source d
 - ✅ **Validé en jeu — évitement d'obstacle en pilotage complet** : confirmé fonctionnel ("il esquive"). Un bug a ensuite été trouvé et corrigé : `isOffsetPathClear` incluait l'obstacle lui-même dans sa propre vérification de dégagement, ce qui faisait échouer la manœuvre (et donc freiner jusqu'à l'arrêt au lieu de contourner) dans la plupart des cas plutôt que de rater juste les cas vraiment bloqués — corrigé, pas encore re-testé en jeu depuis le correctif.
 - ✅ **Validé en jeu (ancien système, vitesse seule, avant le pilotage complet)** : suivi de véhicule, respect des feux, bonne vitesse, contournement d'obstacle via l'évitement natif (aujourd'hui remplacé).
 - 🔧 **Corrigé depuis (sur l'ancien système), jamais re-testé isolément** : freinage tardif aux feux, hésitation en tournant à un carrefour, performance (scan de segment "sticky") — plausiblement déjà couvert par le test grandeur nature du pilotage complet, sans confirmation dédiée.
-- 🆕 **Routage A\* (`router.lua`)** : calcule un itinéraire entre deux segments en respectant les sens uniques ; testé unitairement uniquement, **pas encore branché** sur le comportement des véhicules (aujourd'hui, aucun véhicule n'a de destination — `findLookaheadPoint` vise toujours le carrefour lui-même plutôt que de tourner). Prochaine étape.
+- 🆕🔴 **Routage A\* (`router.lua`) — maintenant BRANCHÉ et ACTIF PAR DÉFAUT, jamais testé en jeu.** Chaque véhicule en pilotage complet se voit maintenant assigner une destination aléatoire et suit vraiment l'itinéraire calculé à travers les vrais carrefours (au lieu de viser le carrefour lui-même sans jamais tourner) ; une nouvelle destination aléatoire est choisie dès que le véhicule arrive au bout de son itinéraire. Respecte les sens uniques (`oneWay`/`flipDirection`, ce dernier n'était même pas extrait du jeu avant). Testé unitairement (15 scénarios) mais **jamais observé en jeu** — c'est le comportement le plus neuf de tous. Si un véhicule tourne bizarrement ou hésite à un carrefour, c'est le premier suspect. Repli sans toucher au reste : `extensions.beamai_core.setRoutingEnabled(false)`. Calcul d'itinéraire plafonné à 2 par tick (`MAX_ROUTE_PLANS_PER_TICK`) pour éviter un à-coup si beaucoup de véhicules ont besoin d'un itinéraire en même temps (ex. juste après un `registerAll()`) — possible micro-saccade à surveiller au tout premier chargement de carte.
 
 ### Tests automatisés (hors-jeu)
 
@@ -96,19 +96,28 @@ extensions.beamai_core.setAvoidanceEnabled(true)
 - Le contourne-t-il visiblement (léger déplacement latéral) au lieu de rester bloqué ou de rentrer dedans ?
 - Toute erreur console au moment de la manœuvre (texte exact).
 
-### Test 5 — pilotage complet maison (maintenant automatique, premier vrai test en conditions réelles)
+### Test 5 — pilotage complet maison (✅ confirmé en jeu)
 
-**Rien à taper.** Lance BeamNG.drive, charge **West Coast, USA**, attends quelques secondes que le trafic apparaisse. Depuis ce changement, tout ce trafic (hors ton propre véhicule) est piloté directement par `steeringController.lua`/`speedController.lua`, plus du tout par `ai.lua`. C'est le tout premier test en conditions réelles de ce pilotage — jamais observé en jeu avant ce test, seulement en simulation hors-jeu.
-
-**Regarde en priorité, sur les premières minutes** :
+**Rien à taper.** Lance BeamNG.drive, charge **West Coast, USA**, attends quelques secondes que le trafic apparaisse. Tout ce trafic (hors ton propre véhicule) est piloté directement par `steeringController.lua`/`speedController.lua`, plus du tout par `ai.lua`. **Confirmé fonctionnel** lors du premier test grandeur nature (avec évitement d'obstacle observé en prime). Si tu revois un problème après une mise à jour :
 - Les véhicules restent-ils sur la route, ou certains partent-ils dans le décor ?
-- Braquent-ils du bon côté dans les virages, ou repartent-ils dans la direction opposée ? (si c'est inversé pour tout le monde à la fois, c'est un seul signe à changer dans `steeringController.lua`, `M.STEERING_SIGN` — un symptôme facile à reconnaître : ça part systématiquement du mauvais côté, pas aléatoirement)
-- La vitesse est-elle stable et fluide, ou ça oscille (accélère/freine sans cesse) ?
-- Toute erreur console (texte exact), surtout répétée.
+- Braquent-ils du bon côté dans les virages ? (si c'est inversé pour tout le monde à la fois, un seul signe à changer dans `steeringController.lua`, `M.STEERING_SIGN`)
+- La vitesse est-elle stable et fluide, ou ça oscille ?
 
-**Si ça part mal** (sortie de route, comportement erratique généralisé) : `extensions.beamai_core.setEnabled(false)` dans la console coupe immédiatement ce mod pour tout le monde (recharge la carte ensuite pour que les véhicules déjà partis en pilotage maison retrouvent une IA native propre). Pour repartir sur l'ancien pilotage (vitesse seule, plus prudent, déjà validé en jeu) sans toucher au code : `extensions.beamai_core.setAutoFullControlOnStart(false)` puis recharge la carte.
+**Si ça part mal** : `extensions.beamai_core.setEnabled(false)` coupe immédiatement ce mod pour tout le monde (recharge la carte ensuite). Pour repartir sur l'ancien pilotage vitesse-seule sans toucher au code : `extensions.beamai_core.setAutoFullControlOnStart(false)` puis recharge la carte.
 
-**Dis-moi** : ce que tu observes sur ces quatre points, et si possible depuis quelle distance/angle tu regardais (un véhicule vu de loin masque des petits écarts de trajectoire qu'on verrait de près).
+### Test 6 — routage et virages aux carrefours (nouveau, jamais testé en jeu)
+
+**Rien à taper non plus.** Depuis ce changement, chaque véhicule en pilotage complet reçoit une destination aléatoire quelque part sur la carte et suit vraiment l'itinéraire calculé — y compris tourner à un vrai carrefour, ce qu'aucune version précédente ne faisait (elles visaient juste le carrefour lui-même et fonçaient dessus). C'est le changement le plus neuf du projet.
+
+**Regarde en priorité** :
+- Un véhicule qui approche un carrefour à plusieurs branches : tourne-t-il proprement dans une des branches, ou hésite-t-il / vise-t-il le milieu du carrefour sans se décider ?
+- Le virage lui-même est-il fluide (le pure pursuit suit un point de visée qui se décale progressivement vers la nouvelle direction) ou brusque/saccadé ?
+- Un véhicule finit-il par se retrouver bloqué, immobile, ou tourner en rond de façon absurde (signe que le routage ou le suivi d'itinéraire a un bug) ?
+- Une micro-saccade générale juste après le chargement de la carte (le calcul d'itinéraire est plafonné à 2 par tick, donc étalé sur plusieurs secondes pour tous les véhicules — un ralentissement bref est possible, un vrai freeze ne devrait pas arriver).
+
+**Si ça part mal** : `extensions.beamai_core.setRoutingEnabled(false)` désactive uniquement le routage sans toucher au reste (les véhicules continuent tout droit/s'arrêtent aux carrefours comme avant ce changement, mais gardent leur pilotage direction/vitesse).
+
+**Dis-moi** : ce que tu observes à un carrefour en particulier (idéalement un carrefour à 3-4 branches, pas juste une route qui continue), et toute erreur console.
 
 ### Débogage isolé (un seul véhicule, si le Test 5 grandeur nature part mal)
 

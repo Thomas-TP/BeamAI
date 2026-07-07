@@ -33,9 +33,12 @@ if ok then
   check("setFullControlEnabled is a function", type(core.setFullControlEnabled) == "function")
   check("setAutoFullControlOnStart is a function", type(core.setAutoFullControlOnStart) == "function")
   check("setAutoScanEnabled is a function", type(core.setAutoScanEnabled) == "function")
+  check("setRoutingEnabled is a function", type(core.setRoutingEnabled) == "function")
   check("onUpdate is a function", type(core.onUpdate) == "function")
   check("starts disabled", core.enabled == false)
   check("full control defaults to on for auto-registered vehicles", core.autoFullControlOnStart == true)
+  check("routing defaults to on", core.routingEnabled == true)
+  check("no routing index until a graph is loaded", core.routingIndex == nil)
 else
   print("  error: " .. tostring(core))
 end

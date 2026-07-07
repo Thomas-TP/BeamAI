@@ -135,10 +135,29 @@
 -- (roadGraph.offsetPointLateral) instead of nudging native side-avoidance,
 -- which doesn't run anymore once ai.setMode('disabled') has been sent. The
 -- side is chosen by checking which offset direction is actually clear of
--- other tracked vehicles right now (roadGraph.isOffsetPathClear). Not yet
--- tested in-game (blocked on full control itself being validated first).
--- Turning decisions at real intersections remain phase 2 (findLookaheadPoint
--- aims at the junction itself rather than guessing a branch).
+-- other tracked vehicles right now (roadGraph.isOffsetPathClear). Confirmed
+-- working in-game ("il esquive"). One bug found and fixed after that: the
+-- clearance check included the obstacle itself, which is reliably closer
+-- than minClearance to the offset target point, so both sides came back
+-- "not clear" and no maneuver ever started in most cases -- the vehicle just
+-- braked to a stop instead of going around. findLeaderOnSegment now returns
+-- the leader's own id so it can be explicitly excluded from that check.
+--
+-- Turning at real intersections (router.lua, roadmap phase 2): until now,
+-- findLookaheadPoint aimed at the junction itself rather than choosing a
+-- branch -- no vehicle had a destination or a planned route at all. Now,
+-- full-control vehicles get a random destination (router.planRandomRoute)
+-- and actually follow the chosen branch through real junctions
+-- (router.findLookaheadPointOnRoute), re-planning a new random destination
+-- once they run off the end of their route. Respects one-way streets
+-- (oneWay + flipDirection -- the latter wasn't even extracted from the game
+-- before this). Route planning (an A* search) is capped at
+-- MAX_ROUTE_PLANS_PER_TICK per tick so a burst of vehicles all needing a
+-- route at once (e.g. right after registerAll()) can't stall a frame; a
+-- vehicle without a route yet this tick just falls back to
+-- roadGraph.findLookaheadPoint's older, never-turns heuristic until its turn
+-- comes up. Not yet tested in-game. Rollback without touching anything else:
+-- extensions.beamai_core.setRoutingEnabled(false).
 
 -- Full path relative to lua/ge/extensions/ (confirmed convention: real shipped
 -- extensions always require siblings this way, e.g.
@@ -155,6 +174,7 @@ local mobil = require("beamai/mobil")
 local avoidance = require("beamai/avoidance")
 local steeringController = require("beamai/steeringController")
 local speedController = require("beamai/speedController")
+local router = require("beamai/router")
 
 local M = {}
 
@@ -171,12 +191,22 @@ M.autoScanEnabled = true
 -- doesn't touch steering) while diagnosing an issue.
 M.autoFullControlOnStart = true
 M.graph = nil
+-- router.buildIndex(M.graph) result, rebuilt whenever M.graph changes (see
+-- setGraphPath) -- expensive to build (scans every junction/segment once) so
+-- built once per graph load, never per tick or per route request.
+M.routingIndex = nil
+-- Whether full-control vehicles actually turn at real junctions by following
+-- a planned route (router.lua), vs. the older geometric-only fallback
+-- (roadGraph.findLookaheadPoint, which just aims at any real junction it
+-- meets). ON by default per explicit request -- see M.setRoutingEnabled.
+M.routingEnabled = true
 -- vehId -> { profile, junctionDecision = {junctionId, obeys}, avoidanceState = <avoidance state> }
 local trackedVehicles = {}
 local JUNCTION_SEARCH_RADIUS = 8.0 -- metres; matches the extractor's clustering radius (~6m) plus margin
 local MAX_LIGHT_LOOKAHEAD = 150.0 -- metres; far enough to brake comfortably from highway speed
 local warnedNoLiveTrafficLightState = false
 local REGISTER_SCAN_INTERVAL = 3.0 -- seconds between automatic re-scans for newly spawned vehicles
+local MAX_ROUTE_PLANS_PER_TICK = 2 -- caps how many A* searches (router.findRoute) run in a single onUpdate tick
 local timeSinceLastScan = math.huge -- forces an immediate scan on the first onUpdate
 local AVOIDANCE_PARAMS = avoidance.defaultParams
 local CREEP_SPEED_MS = 3.0 -- ~11 km/h; cautious speed while easing past a close obstacle
@@ -198,6 +228,9 @@ function M.setGraphPath(path)
     return false
   end
   M.graph = graph
+  -- Built once per graph load (scans every junction once) -- see router.lua
+  -- header comment. Never rebuilt per tick or per vehicle.
+  M.routingIndex = router.buildIndex(graph, JUNCTION_SEARCH_RADIUS)
   log("I", "beamai_core", string.format(
     "loaded road graph '%s': %d segments, %d junctions",
     tostring(graph.map), #graph.segments, #graph.junctions
@@ -239,6 +272,16 @@ function M.setAutoFullControlOnStart(value)
   M.autoFullControlOnStart = value and true or false
 end
 
+-- Opt-in-by-default switch for route-following (router.lua): whether
+-- full-control vehicles actually pick a destination and turn at real
+-- junctions, vs. falling back to roadGraph.findLookaheadPoint's geometric
+-- heuristic (aims at any real junction, never turns). Console rollback if
+-- something looks wrong with turning specifically, without touching the rest
+-- of the pilotage: extensions.beamai_core.setRoutingEnabled(false).
+function M.setRoutingEnabled(value)
+  M.routingEnabled = value and true or false
+end
+
 -- CONFIRMED against the actual installed game's source (lua/vehicle/ai.lua):
 -- ai.setSpeed(speed) takes ONLY the number -- the 'limit' vs 'set' vs 'legal'
 -- behaviour is a *separate* call, ai.setSpeedMode(mode), gating whether/how
@@ -278,6 +321,8 @@ local function trackVehicle(vehId)
       speedControllerState = speedController.newState(),
       lastSegment = nil, -- sticky hint for roadGraph.findNearestSegmentNear, set every tick in onUpdate
       aiDisabled = false,
+      route = nil,       -- router.lua route (list of {segId, entryEnd}), full-control + routing only
+      routeIndex = nil,  -- which step of `route` the vehicle is currently on
     }
   end
   if M.fullControlEnabled then
@@ -523,6 +568,66 @@ local function findStopLineConstraint(graph, segment, ownProj, vehState)
   return distance
 end
 
+-- Which end of `segment` the vehicle is currently heading toward, inferred
+-- from its real heading vector vs. the segment's tangent at its own
+-- projection -- needed to seed router.findRoute/planRandomRoute with the
+-- correct starting direction (a two-way segment can legally be driven either
+-- way, so this can't be assumed).
+local function guessEntryEnd(segment, ownProj, heading)
+  local tangent = roadGraph.tangentAtProjection(segment.nodes, ownProj)
+  if roadGraph.dot(tangent, roadGraph.normalize(heading)) >= 0 then
+    return "start" -- heading roughly the same way as start->end
+  end
+  return "end" -- heading roughly the same way as end->start
+end
+
+-- Finds where in `route` the vehicle's current segment id appears, searching
+-- forward from `hintIndex` first (sticky, same pattern as
+-- roadGraph.findNearestSegmentNear) before falling back to a full scan.
+-- Returns nil if `route` is nil or the segment isn't in it at all -- either
+-- there is no active route yet, or the vehicle has driven past the end of
+-- its planned route (or drifted off it), and the caller should plan a new one.
+local function syncRouteIndex(route, hintIndex, currentSegId)
+  if not route then
+    return nil
+  end
+  for i = hintIndex or 1, #route do
+    if route[i].segId == currentSegId then
+      return i
+    end
+  end
+  for i = 1, (hintIndex or 1) - 1 do
+    if route[i].segId == currentSegId then
+      return i
+    end
+  end
+  return nil
+end
+
+-- Plans a fresh random-destination route for `vehState`, starting from its
+-- current segment/direction, respecting a small per-tick budget
+-- (routePlanBudget) so a burst of vehicles all needing a route on the same
+-- tick (e.g. right after registerAll()) can't stall a single frame with
+-- several A* searches at once -- see docs/ARCHITECTURE.md section 8 phase 9
+-- (per-frame compute budget) for the same idea applied elsewhere later.
+-- Returns the new routeIndex (always 1) on success, nil if the budget was
+-- already spent this tick or no reachable destination was found.
+local function planNewRouteIfBudgetAllows(vehState, routePlanBudget, currentSegId, currentEntryEnd)
+  if routePlanBudget.remaining <= 0 then
+    return nil
+  end
+  routePlanBudget.remaining = routePlanBudget.remaining - 1
+  local route = router.planRandomRoute(M.routingIndex, currentSegId, currentEntryEnd)
+  if route then
+    vehState.route = route
+    vehState.routeIndex = 1
+    return 1
+  end
+  vehState.route = nil
+  vehState.routeIndex = nil
+  return nil
+end
+
 -- Auto-run hook: confirmed real signature (lua/ge/extensions/career/career.lua
 -- and others), fired once a level finishes loading, with the level path. If we
 -- have a bundled graph for this level, load it and switch on automatically --
@@ -546,6 +651,7 @@ end
 function M.onClientEndMission()
   M.setEnabled(false)
   M.graph = nil
+  M.routingIndex = nil
   trackedVehicles = {}
 end
 
@@ -584,6 +690,8 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
       }
     end
   end
+
+  local routePlanBudget = { remaining = MAX_ROUTE_PLANS_PER_TICK }
 
   for vehId, data in pairs(positionsById) do
     local vehState = trackedVehicles[vehId]
@@ -636,7 +744,32 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
 
       if M.fullControlEnabled then
         local lookahead = steeringController.lookaheadDistance(data.speed)
-        local target = roadGraph.findLookaheadPoint(M.graph, segment, ownProj, lookahead, JUNCTION_SEARCH_RADIUS)
+        local target = nil
+
+        -- Route-following: actually turn at real junctions (router.lua)
+        -- instead of just aiming at them. Falls back to the geometric-only
+        -- heuristic (roadGraph.findLookaheadPoint, never turns) whenever
+        -- there's no usable route yet -- routing disabled, graph has no
+        -- routing index, this vehicle's route ran out/was never planned and
+        -- the per-tick A* budget is already spent, or no reachable
+        -- destination was found -- so a vehicle is never left without any
+        -- lookahead target at all.
+        if M.routingEnabled and M.routingIndex then
+          local syncedIndex = syncRouteIndex(vehState.route, vehState.routeIndex, segment.id)
+          if not syncedIndex then
+            local entryEnd = guessEntryEnd(segment, ownProj, data.heading)
+            syncedIndex = planNewRouteIfBudgetAllows(vehState, routePlanBudget, segment.id, entryEnd)
+          end
+          if syncedIndex then
+            vehState.routeIndex = syncedIndex
+            target = router.findLookaheadPointOnRoute(M.routingIndex, vehState.route, syncedIndex, ownProj, lookahead)
+          end
+        end
+
+        if not target then
+          target = roadGraph.findLookaheadPoint(M.graph, segment, ownProj, lookahead, JUNCTION_SEARCH_RADIUS)
+        end
+
         if lateralOffsetMetres ~= 0 then
           local lateralDir = roadGraph.lateralDirectionAtProjection(segment.nodes, ownProj)
           target = roadGraph.offsetPointLateral(target, lateralDir, lateralOffsetMetres)

@@ -246,4 +246,117 @@ function M.findRoute(index, startSegId, startEntryEnd, goalSegId)
   return nil -- goal unreachable from here under the current one-way restrictions
 end
 
+-- Picks a uniformly random destination segment id, different from
+-- `excludeSegId` when possible (falls back to whatever was last drawn if 5
+-- tries keep landing on it -- only matters for tiny graphs). `rng` is
+-- injectable for tests, same convention as driverProfile.lua: defaults to
+-- math.random, called with no arguments, must return a float in [0, 1).
+function M.pickRandomDestination(graph, excludeSegId, rng)
+  rng = rng or math.random
+  local n = #graph.segments
+  if n == 0 then
+    return nil
+  end
+  local candidate
+  for _ = 1, 5 do
+    local idx = math.min(math.floor(rng() * n) + 1, n)
+    candidate = graph.segments[idx].id
+    if candidate ~= excludeSegId then
+      return candidate
+    end
+  end
+  return candidate
+end
+
+-- Picks a random destination and finds a route to it in one call, retrying a
+-- few times if the first pick(s) turn out unreachable (e.g. an isolated
+-- one-way pocket, or a dead-end segment with no onward junction). Returns nil
+-- if no reachable destination was found within maxAttempts -- callers should
+-- just retry on a later tick/call rather than treating this as an error.
+function M.planRandomRoute(index, currentSegId, currentEntryEnd, rng, maxAttempts)
+  maxAttempts = maxAttempts or 5
+  for _ = 1, maxAttempts do
+    local destSegId = M.pickRandomDestination(index.graph, currentSegId, rng)
+    if destSegId then
+      local route = M.findRoute(index, currentSegId, currentEntryEnd, destSegId)
+      if route and #route > 1 then
+        return route
+      end
+    end
+  end
+  return nil
+end
+
+-- Distance remaining on `seg` from `proj`, continuing in the direction of
+-- travel implied by `entryEnd` ("start" = entered at the start, travelling
+-- toward the end; "end" = the reverse).
+local function remainingOnSegment(seg, proj, entryEnd)
+  local total = roadGraph.segmentLength(seg.nodes)
+  if entryEnd == "start" then
+    return total - proj.distanceAlong
+  end
+  return proj.distanceAlong
+end
+
+-- The point `dist` metres further along `seg`, continuing in the travel
+-- direction implied by `entryEnd`, starting from arc-length position
+-- `fromDistanceAlong`. roadGraph.pointAtDistance's own clamping (to the first
+-- node when the target distance is <= 0) happens to be exactly the right
+-- clamp for backward travel too, since the first node IS where a
+-- backward-travelled segment is exited.
+local function pointAlongDirected(seg, fromDistanceAlong, dist, entryEnd)
+  if entryEnd == "start" then
+    return roadGraph.pointAtDistance(seg.nodes, fromDistanceAlong + dist)
+  end
+  return roadGraph.pointAtDistance(seg.nodes, fromDistanceAlong - dist)
+end
+
+-- Route-aware equivalent of roadGraph.findLookaheadPoint: instead of a
+-- geometric heuristic (follow "continuation" junctions, aim at any real
+-- junction otherwise -- see roadGraph.lua), this follows a specific planned
+-- route (from findRoute/planRandomRoute) through however many real junctions
+-- the lookahead distance reaches, since the route already says which branch
+-- to take at each one -- no guessing needed.
+--
+-- `routeIndex` must point at the step of `route` matching the segment
+-- `ownProj` was computed against (the caller is responsible for keeping this
+-- in sync with the vehicle's actual position tick to tick -- see core.lua).
+-- Returns the world-space lookahead point, and the routeIndex it ended up on
+-- (so the caller can advance its own tracking once the vehicle physically
+-- reaches that step). If the lookahead distance runs past the end of the
+-- planned route, aims at the route's final point instead of guessing further
+-- -- the caller is expected to plan a new route once the vehicle actually
+-- arrives there (see core.lua).
+function M.findLookaheadPointOnRoute(index, route, routeIndex, ownProj, lookaheadDistance)
+  local step = route[routeIndex]
+  local seg = index.segmentById[step.segId]
+  local remaining = remainingOnSegment(seg, ownProj, step.entryEnd)
+
+  if lookaheadDistance <= remaining then
+    return pointAlongDirected(seg, ownProj.distanceAlong, lookaheadDistance, step.entryEnd), routeIndex
+  end
+
+  local distanceIntoNext = lookaheadDistance - remaining
+  local i = routeIndex + 1
+  while route[i] do
+    local nextStep = route[i]
+    local nextSeg = index.segmentById[nextStep.segId]
+    local nextLen = roadGraph.segmentLength(nextSeg.nodes)
+    if distanceIntoNext <= nextLen then
+      local fromDist = nextStep.entryEnd == "start" and 0 or nextLen
+      return pointAlongDirected(nextSeg, fromDist, distanceIntoNext, nextStep.entryEnd), i
+    end
+    distanceIntoNext = distanceIntoNext - nextLen
+    i = i + 1
+  end
+
+  -- Ran past the end of the planned route: aim at the last point of the
+  -- final leg rather than extrapolating past mapped road.
+  local lastStep = route[#route]
+  local lastSeg = index.segmentById[lastStep.segId]
+  local lastLen = roadGraph.segmentLength(lastSeg.nodes)
+  local endDist = lastStep.entryEnd == "start" and lastLen or 0
+  return roadGraph.pointAtDistance(lastSeg.nodes, endDist), #route
+end
+
 return M
