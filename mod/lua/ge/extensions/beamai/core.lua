@@ -49,12 +49,19 @@
 -- in isolation first (one vehicle, one stationary obstacle, empty road) --
 -- see README.md -- before trusting it in full city traffic.
 
-local idm = require("idm")
-local roadGraph = require("roadGraph")
-local trafficLights = require("trafficLights")
-local driverProfile = require("driverProfile")
-local mobil = require("mobil")
-local avoidance = require("avoidance")
+-- Full path relative to lua/ge/extensions/ (confirmed convention: real shipped
+-- extensions always require siblings this way, e.g.
+-- lua/ge/extensions/util/trackBuilder/segmentToProceduralMesh.lua does
+-- require('util/trackBuilder/basicCenters') for a file in its own folder --
+-- never a bare require("basicCenters"). A bare require("idm") here caused a
+-- real in-game error ("loop or previous error loading module") the first
+-- time this was tested live.
+local idm = require("beamai/idm")
+local roadGraph = require("beamai/roadGraph")
+local trafficLights = require("beamai/trafficLights")
+local driverProfile = require("beamai/driverProfile")
+local mobil = require("beamai/mobil")
+local avoidance = require("beamai/avoidance")
 
 local M = {}
 
