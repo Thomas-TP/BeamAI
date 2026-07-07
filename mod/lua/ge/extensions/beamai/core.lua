@@ -158,6 +158,27 @@
 -- roadGraph.findLookaheadPoint's older, never-turns heuristic until its turn
 -- comes up. Not yet tested in-game. Rollback without touching anything else:
 -- extensions.beamai_core.setRoutingEnabled(false).
+--
+-- Priority at real (non-signalized) junctions (roadmap phase 2): until now, a
+-- "junction"-type node had zero priority logic -- vehicles just drove
+-- straight through regardless of cross traffic, since only trafficLight
+-- junctions were ever treated as a stop-line constraint. tools/extract_road_graph.py
+-- now assigns each real junction a priorityRule -- "roadClassHierarchy" when
+-- one approach is a strictly higher road class than the others (that
+-- approach has priority, the rest yield), else "allWayStop" (everyone
+-- yields -- the common USA unsignalized-intersection default, also just a
+-- safe default in general: requiring a stop is never unsafe, only
+-- cautious). findJunctionPriorityConstraint enforces a real, mandatory full
+-- stop the first time a yielding vehicle reaches the line (not just a
+-- yield/roll-through) -- tracked per vehicle per junction
+-- (vehState.junctionStopState) -- then only re-imposes the constraint once
+-- stopped if another moving vehicle is actually near the junction
+-- (roadGraph.isCrossTrafficNearJunction, a straight-line-distance heuristic,
+-- not real trajectory prediction -- see roadmap phase 3bis). No FIFO
+-- ordering between multiple simultaneously-waiting vehicles yet (a vehicle
+-- could in principle wait a long time if traffic keeps arriving on another
+-- approach) -- a known, documented limitation, not an oversight. Not yet
+-- tested in-game.
 
 -- Full path relative to lua/ge/extensions/ (confirmed convention: real shipped
 -- extensions always require siblings this way, e.g.
@@ -200,6 +221,12 @@ M.routingIndex = nil
 -- (roadGraph.findLookaheadPoint, which just aims at any real junction it
 -- meets). ON by default per explicit request -- see M.setRoutingEnabled.
 M.routingEnabled = true
+-- Whether stop/yield priority at real (non-signalized) junctions is enforced
+-- (findJunctionPriorityConstraint) -- see M.setJunctionPriorityEnabled. ON by
+-- default, separate switch from M.routingEnabled: this affects whether a
+-- vehicle stops/yields, routing affects which branch it takes: independent
+-- concerns, independent rollback.
+M.junctionPriorityEnabled = true
 -- vehId -> { profile, junctionDecision = {junctionId, obeys}, avoidanceState = <avoidance state> }
 local trackedVehicles = {}
 local JUNCTION_SEARCH_RADIUS = 8.0 -- metres; matches the extractor's clustering radius (~6m) plus margin
@@ -212,6 +239,10 @@ local AVOIDANCE_PARAMS = avoidance.defaultParams
 local CREEP_SPEED_MS = 3.0 -- ~11 km/h; cautious speed while easing past a close obstacle
 local DEFAULT_AWARENESS_COEF = 0.25 -- lua/vehicle/ai.lua's own default for parameters.awarenessForceCoef
 local BOOSTED_AWARENESS_COEF = 1.0 -- more decisive native side-avoidance while easing past, at low speed
+local STOP_SPEED_THRESHOLD_MS = 1.0 -- ~3.6 km/h; below this counts as "has come to a stop" at a priority junction
+local STOP_ARRIVAL_RADIUS_M = 3.0 -- metres from the stop line within which a full stop actually counts
+local CROSS_TRAFFIC_RADIUS_M = 18.0 -- metres from a junction within which another moving vehicle blocks a yield
+local CROSS_TRAFFIC_MIN_SPEED_MS = 0.5 -- ignore other near-stationary (parked/already-waiting) vehicles near the junction
 
 -- Maps a level name (as returned by path.levelFromPath) to a bundled road
 -- graph shipped inside this mod, for fully automatic setup -- no console
@@ -282,6 +313,15 @@ function M.setRoutingEnabled(value)
   M.routingEnabled = value and true or false
 end
 
+-- Opt-in-by-default switch for stop/yield priority at real (non-signalized)
+-- junctions (findJunctionPriorityConstraint). Independent from
+-- M.setRoutingEnabled -- this can be turned off on its own (vehicles keep
+-- turning, but stop enforcing/yielding at unsignalized junctions) if it
+-- turns out to be the culprit for a specific issue, without losing routing.
+function M.setJunctionPriorityEnabled(value)
+  M.junctionPriorityEnabled = value and true or false
+end
+
 -- CONFIRMED against the actual installed game's source (lua/vehicle/ai.lua):
 -- ai.setSpeed(speed) takes ONLY the number -- the 'limit' vs 'set' vs 'legal'
 -- behaviour is a *separate* call, ai.setSpeedMode(mode), gating whether/how
@@ -317,6 +357,7 @@ local function trackVehicle(vehId)
     trackedVehicles[vehId] = {
       profile = driverProfile.generate(),
       junctionDecision = { junctionId = nil, obeys = true },
+      junctionStopState = { junctionId = nil, hasStopped = false }, -- stop-sign/yield state at a priority junction, see findJunctionPriorityConstraint
       avoidanceState = avoidance.newState(),
       speedControllerState = speedController.newState(),
       lastSegment = nil, -- sticky hint for roadGraph.findNearestSegmentNear, set every tick in onUpdate
@@ -460,6 +501,20 @@ local function buildOtherPositionsList(positionsById, ownVehId, leaderVehId)
   return list
 end
 
+-- Same idea as buildOtherPositionsList, but keeps each vehicle's speed too --
+-- needed by roadGraph.isCrossTrafficNearJunction (a near-stationary vehicle
+-- already waiting/parked near a junction shouldn't block a yield). Only
+-- built when actually checking a junction yield, not every tick.
+local function buildOtherPositionsWithSpeed(positionsById, ownVehId, leaderVehId)
+  local list = {}
+  for otherVehId, data in pairs(positionsById) do
+    if otherVehId ~= ownVehId and otherVehId ~= leaderVehId then
+      table.insert(list, { pos = data.pos, speed = data.speed })
+    end
+  end
+  return list
+end
+
 -- Full-control equivalent of updateAvoidance (below): there is no native
 -- side-avoidance to nudge anymore once ai.setMode('disabled') has been sent,
 -- so this instead drives a continuous signed lateral offset (metres) of our
@@ -566,6 +621,55 @@ local function findStopLineConstraint(graph, segment, ownProj, vehState)
     return nil -- already at or past the stop line
   end
   return distance
+end
+
+-- Real (non-signalized) junction priority: stop signs / priority-to-the-major-road
+-- (roadmap phase 2, docs/ARCHITECTURE.md section 8). Two-stage, tracked per
+-- vehicle per junction (vehState.junctionStopState, reset whenever the
+-- upcoming junction id changes -- same pattern as junctionDecision above):
+--   1. Not yet stopped -- treat the stop line as a hard constraint (virtual
+--      stationary leader, exactly like a red light) regardless of whether
+--      the junction is empty, until speed drops below STOP_SPEED_THRESHOLD_MS
+--      within STOP_ARRIVAL_RADIUS_M of the line. This is what makes it a
+--      real stop-sign-like "arrêt complet obligatoire, y compris sans trafic
+--      visible" instead of a mere yield/roll-through.
+--   2. Once stopped once at this junction: only re-impose the constraint
+--      when another moving vehicle is actually near the junction
+--      (roadGraph.isCrossTrafficNearJunction) -- otherwise clear to proceed.
+-- Builds the cross-traffic position list (buildOtherPositionsWithSpeed) only
+-- on the rare ticks it's actually needed -- i.e. once this vehicle has
+-- already come to its mandatory stop -- rather than every tick for every
+-- tracked vehicle, matching the same lazy pattern updateFullControlAvoidance
+-- uses for its own clearance check.
+local function findJunctionPriorityConstraint(graph, segment, ownProj, vehState, ownVehId, leaderVehId, ownSpeed, positionsById)
+  local junction, distance, mustYield = roadGraph.findUpcomingPriorityJunction(
+    graph, segment, ownProj, MAX_LIGHT_LOOKAHEAD, JUNCTION_SEARCH_RADIUS)
+  if not junction or not mustYield then
+    return nil
+  end
+
+  if vehState.junctionStopState.junctionId ~= junction.id then
+    vehState.junctionStopState.junctionId = junction.id
+    vehState.junctionStopState.hasStopped = false
+  end
+
+  if distance <= 0 then
+    return nil -- already at or past the stop line
+  end
+
+  if not vehState.junctionStopState.hasStopped then
+    if ownSpeed < STOP_SPEED_THRESHOLD_MS and distance < STOP_ARRIVAL_RADIUS_M then
+      vehState.junctionStopState.hasStopped = true
+    else
+      return distance -- keep decelerating toward a full stop at the line
+    end
+  end
+
+  local otherPositions = buildOtherPositionsWithSpeed(positionsById, ownVehId, leaderVehId)
+  if roadGraph.isCrossTrafficNearJunction(junction.position, otherPositions, CROSS_TRAFFIC_RADIUS_M, CROSS_TRAFFIC_MIN_SPEED_MS) then
+    return distance -- stopped once already, but still yielding to real traffic
+  end
+  return nil -- stopped once, junction is clear: go
 end
 
 -- Which end of `segment` the vehicle is currently heading toward, inferred
@@ -722,15 +826,22 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
       end
 
       local lightGap = findStopLineConstraint(M.graph, segment, ownProj, vehState)
+      local junctionGap = nil
+      if M.junctionPriorityEnabled then
+        junctionGap = findJunctionPriorityConstraint(
+          M.graph, segment, ownProj, vehState, vehId, vehLeaderId, data.speed, positionsById)
+      end
 
       -- Whichever obstacle is nearer along the path is the binding constraint
       -- for IDM (same simplification used by most simple traffic-AI stacks:
-      -- the stop line is just a stationary leader at speed 0).
-      local gap, leaderSpeed
-      if lightGap ~= nil and (vehGap == nil or lightGap < vehGap) then
+      -- a stop line -- traffic light or priority junction -- is just a
+      -- stationary leader at speed 0).
+      local gap, leaderSpeed = vehGap, vehLeaderSpeed
+      if lightGap ~= nil and (gap == nil or lightGap < gap) then
         gap, leaderSpeed = lightGap, 0
-      else
-        gap, leaderSpeed = vehGap, vehLeaderSpeed
+      end
+      if junctionGap ~= nil and (gap == nil or junctionGap < gap) then
+        gap, leaderSpeed = junctionGap, 0
       end
 
       local profile = vehState.profile

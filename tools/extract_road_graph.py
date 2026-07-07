@@ -235,9 +235,47 @@ def match_traffic_lights(clusters: list[dict], signals: dict | None, radius: flo
             ]
 
 
+# Rank order matching ROAD_CLASS_WIDTH_THRESHOLDS (higher number = higher
+# priority). A default-priority heuristic only — real signed priority (a
+# priority-road sign overriding class, a give-way sign on an objectively
+# major road, etc.) is not encoded anywhere in BeamNG and would need manual
+# correction or a real OSM import (section 4.2, section 6).
+ROAD_CLASS_RANK = {"trunk": 4, "primary": 3, "secondary": 2, "residential": 1}
+
+
+def assign_junction_priority(junction: dict, segments_by_id: dict) -> None:
+    """Fills in junction['priorityRule'] and a per-approach mustYield flag for
+    a real (non-continuation, non-trafficLight) junction, using a road-class
+    hierarchy heuristic: an approach whose road is a strictly higher class
+    than every other approach gets priority (no stop); everyone else yields.
+    When no such hierarchy exists (all approaches the same class), treats it
+    as an all-way stop -- the common unsignalized-intersection default for a
+    USA-style map (see docs/ARCHITECTURE.md section 2.3/6), and a safe
+    default in general: it's never wrong to require a full stop, only overly
+    cautious, whereas guessing a false priority could be genuinely unsafe.
+    """
+    ranks = [ROAD_CLASS_RANK.get(segments_by_id[sid]["roadClass"], 1) for sid in junction["approaches"]]
+    max_rank = max(ranks)
+    has_hierarchy = ranks.count(max_rank) < len(ranks)
+
+    if has_hierarchy:
+        junction["priorityRule"] = "roadClassHierarchy"
+    else:
+        junction["priorityRule"] = "allWayStop"
+
+    junction["approachPriority"] = [
+        {
+            "segmentId": sid,
+            "mustYield": (not has_hierarchy) or (ROAD_CLASS_RANK.get(segments_by_id[sid]["roadClass"], 1) < max_rank),
+        }
+        for sid in junction["approaches"]
+    ]
+
+
 def build_graph(level_name: str, zf: zipfile.ZipFile) -> dict:
     segments = load_decal_roads(zf)
     signals = load_signals(zf, level_name)
+    segments_by_id = {s["id"]: s for s in segments}
     clusters = cluster_junctions(segments)
     match_traffic_lights(clusters, signals)
 
@@ -246,18 +284,20 @@ def build_graph(level_name: str, zf: zipfile.ZipFile) -> dict:
         base_type = classify_cluster(c)
         # A traffic light is never a mere continuation of the same road.
         junction_type = "trafficLight" if "trafficLightGroupId" in c else base_type
-        junctions.append(
-            {
-                "id": f"j_{i:04d}",
-                "position": c["position"],
-                "type": junction_type,
-                "trafficLightGroupId": c.get("trafficLightGroupId"),
-                "trafficLightControllerIds": c.get("trafficLightControllerIds"),
-                "trafficLightInstances": c.get("trafficLightInstances"),
-                "priorityRule": None,  # section 4.2 / 6 — assign via ruleset or manual editor
-                "approaches": sorted(c["segmentIds"]),
-            }
-        )
+        junction = {
+            "id": f"j_{i:04d}",
+            "position": c["position"],
+            "type": junction_type,
+            "trafficLightGroupId": c.get("trafficLightGroupId"),
+            "trafficLightControllerIds": c.get("trafficLightControllerIds"),
+            "trafficLightInstances": c.get("trafficLightInstances"),
+            "priorityRule": None,  # section 4.2 / 6 — assign via ruleset or manual editor
+            "approachPriority": None,
+            "approaches": sorted(c["segmentIds"]),
+        }
+        if junction_type == "junction":
+            assign_junction_priority(junction, segments_by_id)
+        junctions.append(junction)
 
     return {
         "map": level_name,

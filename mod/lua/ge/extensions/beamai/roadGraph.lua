@@ -201,6 +201,92 @@ function M.findUpcomingTrafficLight(graph, segment, ownProj, maxLookahead, junct
   return nil, nil
 end
 
+-- Looks ahead (through continuation segments) for the nearest upcoming
+-- non-signalized real junction (type == "junction") -- one with a stop/yield
+-- priority rule assigned by tools/extract_road_graph.py's
+-- assign_junction_priority (roadClass hierarchy, or an all-way-stop default
+-- when no class hierarchy exists). Stops looking at a trafficLight junction
+-- or an unclassified one (out of scope here -- see findUpcomingTrafficLight
+-- for the traffic-light case).
+--
+-- Returns junction, distanceToStopLine (metres from ownProj), mustYield
+-- (whether the specific approach segment actually being driven when the
+-- junction is reached must yield -- fails safe to true, i.e. yield, if this
+-- approach isn't listed for some reason), or nil, nil, nil if none found
+-- within maxLookahead.
+function M.findUpcomingPriorityJunction(graph, segment, ownProj, maxLookahead, junctionRadius)
+  local distanceSoFar = M.segmentLength(segment.nodes) - ownProj.distanceAlong
+  local currentSeg = segment
+  local visited = { [segment.id] = true }
+
+  while distanceSoFar <= maxLookahead do
+    local endNode = currentSeg.nodes[#currentSeg.nodes]
+    local junction = M.findJunctionNear(graph, { endNode[1], endNode[2], endNode[3] }, junctionRadius)
+    if not junction then
+      return nil, nil, nil
+    end
+    if junction.type == "junction" then
+      local mustYield = true -- fail safe: an unlisted approach must yield
+      if junction.approachPriority then
+        for _, ap in ipairs(junction.approachPriority) do
+          if ap.segmentId == currentSeg.id then
+            mustYield = ap.mustYield
+            break
+          end
+        end
+      end
+      return junction, distanceSoFar, mustYield
+    end
+    if junction.type ~= "continuation" then
+      return nil, nil, nil -- trafficLight or unclassified: not this function's concern
+    end
+
+    local nextId = nil
+    for _, sid in ipairs(junction.approaches) do
+      if sid ~= currentSeg.id then
+        nextId = sid
+      end
+    end
+    if not nextId or visited[nextId] then
+      return nil, nil, nil
+    end
+    visited[nextId] = true
+
+    local nextSeg = M.findSegmentById(graph, nextId)
+    if not nextSeg then
+      return nil, nil, nil
+    end
+    distanceSoFar = distanceSoFar + M.segmentLength(nextSeg.nodes)
+    currentSeg = nextSeg
+  end
+
+  return nil, nil, nil
+end
+
+-- Whether any position in `otherPositions` (list of {pos={x,y,z}, speed=n})
+-- is close enough to `junctionPosition`, and moving fast enough, to
+-- plausibly be about to enter the junction -- a simple straight-line
+-- distance heuristic, not a real trajectory prediction (that's the
+-- not-yet-built prediction layer, docs/ARCHITECTURE.md section 8 phase
+-- 3bis). Ignores near-stationary vehicles (already waiting, parked) since
+-- they aren't a collision risk right now. Used to decide whether a yielding
+-- vehicle can actually proceed once it has come to a stop.
+function M.isCrossTrafficNearJunction(junctionPosition, otherPositions, radius, minSpeed)
+  radius = radius or 18.0
+  minSpeed = minSpeed or 0.5
+  for _, other in ipairs(otherPositions) do
+    if other.speed >= minSpeed then
+      local dx = other.pos[1] - junctionPosition[1]
+      local dy = other.pos[2] - junctionPosition[2]
+      local dz = other.pos[3] - junctionPosition[3]
+      if math.sqrt(dx * dx + dy * dy + dz * dz) <= radius then
+        return true
+      end
+    end
+  end
+  return false
+end
+
 -- The world-space point `lookaheadDistance` metres ahead of `ownProj` (on
 -- `segment`) along the path, for the pure-pursuit steering controller
 -- (steeringController.lua). Transparently crosses into the next segment

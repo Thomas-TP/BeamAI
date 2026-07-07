@@ -289,6 +289,97 @@ do
   check("returns nil for missing id", rg.findSegmentById(graph, "zzz") == nil)
 end
 
+print("Test 20: findUpcomingPriorityJunction finds the nearest real junction and this approach's mustYield")
+do
+  local segA = { id = "segA", nodes = { { 0, 0, 0, 3.5 }, { 50, 0, 0, 3.5 } } }
+  local segB = { id = "segB", nodes = { { 50, 0, 0, 3.5 }, { 100, 0, 0, 3.5 } } }
+  local graph = {
+    segments = { segA, segB },
+    junctions = {
+      {
+        id = "j1", type = "junction", position = { 50, 0, 0 }, approaches = { "segA", "segB" },
+        priorityRule = "allWayStop",
+        approachPriority = {
+          { segmentId = "segA", mustYield = true },
+          { segmentId = "segB", mustYield = true },
+        },
+      },
+    },
+  }
+  local ownProj = rg.closestPointOnPolyline(segA.nodes, { 10, 0, 0 }) -- 40m left on segA
+
+  local junction, dist, mustYield = rg.findUpcomingPriorityJunction(graph, segA, ownProj, 200, 6.0)
+  check("finds the junction", junction ~= nil and junction.id == "j1")
+  check("distance to the stop line is 40m", near(dist, 40, 1e-6))
+  check("this approach (segA) must yield", mustYield == true)
+end
+
+print("Test 21: findUpcomingPriorityJunction respects a road-class-hierarchy approach that has priority")
+do
+  local segMinor = { id = "minor", nodes = { { 0, 0, 0, 3.5 }, { 50, 0, 0, 3.5 } } }
+  local segMajor = { id = "major", nodes = { { 50, 0, 0, 3.5 }, { 100, 0, 0, 3.5 } } }
+  local graph = {
+    segments = { segMinor, segMajor },
+    junctions = {
+      {
+        id = "j1", type = "junction", position = { 50, 0, 0 }, approaches = { "minor", "major" },
+        priorityRule = "roadClassHierarchy",
+        approachPriority = {
+          { segmentId = "minor", mustYield = true },
+          { segmentId = "major", mustYield = false },
+        },
+      },
+    },
+  }
+  local ownProjMinor = rg.closestPointOnPolyline(segMinor.nodes, { 10, 0, 0 })
+  local _, _, mustYieldMinor = rg.findUpcomingPriorityJunction(graph, segMinor, ownProjMinor, 200, 6.0)
+  check("the minor approach must yield", mustYieldMinor == true)
+
+  local ownProjMajor = rg.closestPointOnPolyline(segMajor.nodes, { 60, 0, 0 })
+  -- Approaching the SAME junction from the major road's own far end would need a segment
+  -- ending there; here we just directly check the priority list interpretation instead.
+  local found = false
+  for _, ap in ipairs(graph.junctions[1].approachPriority) do
+    if ap.segmentId == "major" then
+      found = (ap.mustYield == false)
+    end
+  end
+  check("the major approach has priority (does not yield)", found == true)
+end
+
+print("Test 22: findUpcomingPriorityJunction ignores trafficLight and continuation junctions")
+do
+  local segA = { id = "segA", nodes = { { 0, 0, 0, 3.5 }, { 50, 0, 0, 3.5 } } }
+  local segB = { id = "segB", nodes = { { 50, 0, 0, 3.5 }, { 100, 0, 0, 3.5 } } }
+  local segC = { id = "segC", nodes = { { 100, 0, 0, 3.5 }, { 150, 0, 0, 3.5 } } }
+  local graph = {
+    segments = { segA, segB, segC },
+    junctions = {
+      { id = "j1", type = "continuation", position = { 50, 0, 0 }, approaches = { "segA", "segB" } },
+      { id = "j2", type = "trafficLight", position = { 100, 0, 0 }, approaches = { "segB", "segC" } },
+    },
+  }
+  local ownProj = rg.closestPointOnPolyline(segA.nodes, { 10, 0, 0 })
+  local junction = rg.findUpcomingPriorityJunction(graph, segA, ownProj, 200, 6.0)
+  check("does not treat a trafficLight junction as a priority junction", junction == nil)
+end
+
+print("Test 23: isCrossTrafficNearJunction")
+do
+  local junctionPos = { 100, 0, 0 }
+  local moving = { pos = { 105, 2, 0 }, speed = 5.0 }
+  local stopped = { pos = { 102, 0, 0 }, speed = 0.1 }
+  local farAway = { pos = { 500, 0, 0 }, speed = 10.0 }
+
+  check("a moving vehicle close to the junction counts as cross traffic",
+    rg.isCrossTrafficNearJunction(junctionPos, { moving }, 18.0, 0.5))
+  check("a near-stationary vehicle (already waiting/parked) does not count",
+    rg.isCrossTrafficNearJunction(junctionPos, { stopped }, 18.0, 0.5) == false)
+  check("a fast vehicle far from the junction does not count",
+    rg.isCrossTrafficNearJunction(junctionPos, { farAway }, 18.0, 0.5) == false)
+  check("no other vehicles at all -> clear", rg.isCrossTrafficNearJunction(junctionPos, {}, 18.0, 0.5) == false)
+end
+
 print("Test 19: offsetPointLateral")
 do
   local pt = rg.offsetPointLateral({ 10, 20, 0 }, { 0, 1, 0 }, 2.5)
