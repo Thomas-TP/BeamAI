@@ -169,6 +169,40 @@ do
     rg.isPlausibleLeader(segment, rg.closestPointOnPolyline(segment.nodes, { 60, 5, 0 }), { 10, 0, 0 }, 10) == false)
 end
 
+print("Test 11: lateralDirectionAtProjection is perpendicular to travel")
+do
+  local proj = rg.closestPointOnPolyline(straightNodes, { 60, 0, 0 })
+  local lateral = rg.lateralDirectionAtProjection(straightNodes, proj)
+  check("perpendicular to +X tangent (dot ~ 0)", near(rg.dot(lateral, { 1, 0, 0 }), 0, 1e-6))
+  check("unit length", near(lateral[1] * lateral[1] + lateral[2] * lateral[2], 1, 1e-6))
+end
+
+print("Test 12: isOffsetPathClear detects a vehicle in the way, ignores irrelevant ones")
+do
+  local segment = { width = 3.5, nodes = straightNodes }
+  local ownProj = rg.closestPointOnPolyline(straightNodes, { 20, 0, 0 })
+  local lateral = rg.lateralDirectionAtProjection(straightNodes, ownProj)
+  local offset = 2.2
+
+  local blockingPos = {
+    ownProj.point[1] + 10 * 1 + lateral[1] * offset, -- 10m ahead, right at the offset lane
+    ownProj.point[2] + lateral[2] * offset,
+    ownProj.point[3],
+  }
+  check("a vehicle sitting in the offset path blocks it",
+    rg.isOffsetPathClear(segment, ownProj, offset, 20.0, { blockingPos }, 2.5) == false)
+
+  local farAwayPos = { ownProj.point[1] + 10, ownProj.point[2] + 20, ownProj.point[3] }
+  check("a vehicle far to the side does not block it",
+    rg.isOffsetPathClear(segment, ownProj, offset, 20.0, { farAwayPos }, 2.5) == true)
+
+  local behindPos = { ownProj.point[1] - 30, ownProj.point[2], ownProj.point[3] }
+  check("a vehicle well behind us does not block it",
+    rg.isOffsetPathClear(segment, ownProj, offset, 20.0, { behindPos }, 2.5) == true)
+
+  check("no other vehicles at all -> clear", rg.isOffsetPathClear(segment, ownProj, offset, 20.0, {}, 2.5) == true)
+end
+
 print("Test 6: findSegmentById")
 do
   local graph = { segments = { { id = "a" }, { id = "b" } } }

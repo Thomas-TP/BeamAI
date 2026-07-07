@@ -29,27 +29,46 @@
 --      avoidance: a "reckless" driver still never intentionally rear-ends
 --      someone, it just may not stop for a light with nothing physically in
 --      the way.
--- Explicitly NOT attempted here (flagged by the same playtest, needs its own
--- design pass): swerving around a stopped/broken-down obstacle while still
--- avoiding oncoming/adjacent traffic. That needs lateral path control (this
--- mod currently only ever calls ai.setSpeed, never touches steering/path) --
--- roadmap phase 3/4 territory, not a quick patch on top of this loop.
+-- Phase 3, first increment -- lateral obstacle avoidance (roadmap phase 3/4):
+-- EXPERIMENTAL, OFF BY DEFAULT (see M.setAvoidanceEnabled). Unlike everything
+-- above, this one physically displaces the vehicle sideways via ai.laneChange
+-- -- confirmed to exist and be clamped to the road's own drivable width by the
+-- game's source (lua/vehicle/ai.lua), so it cannot drive the vehicle off the
+-- pavement, but two things are genuinely unverified in-game:
+--   - which way is "left" vs "right" for the signed offset it's given (the
+--     maneuver is internally consistent either way -- always the same side
+--     relative to travel direction -- but which physical side that is has not
+--     been observed yet; watch the first test and flip the hardcoded sign
+--     argument (currently 1) passed to avoidance.update in updateAvoidance
+--     below if it swerves the wrong way).
+--   - whether the interaction with the ongoing IDM speed control (suppressed
+--     for the original obstacle while a maneuver is in progress, see onUpdate)
+--     actually reads as smooth driving rather than a lurch.
+-- Decision logic (mobil.lua, avoidance.lua state machine) is pure and fully
+-- unit tested; only the ai.laneChange dispatch itself is unverified. Test it
+-- in isolation first (one vehicle, one stationary obstacle, empty road) --
+-- see README.md -- before trusting it in full city traffic.
 
 local idm = require("idm")
 local roadGraph = require("roadGraph")
 local trafficLights = require("trafficLights")
 local driverProfile = require("driverProfile")
+local mobil = require("mobil")
+local avoidance = require("avoidance")
 
 local M = {}
 
 M.enabled = false
+M.avoidanceEnabled = false
 M.graph = nil
-local trackedVehicles = {} -- vehId -> { profile = <driverProfile>, junctionDecision = {junctionId, obeys} }
+-- vehId -> { profile, junctionDecision = {junctionId, obeys}, avoidanceState = <avoidance state> }
+local trackedVehicles = {}
 local JUNCTION_SEARCH_RADIUS = 8.0 -- metres; matches the extractor's clustering radius (~6m) plus margin
 local MAX_LIGHT_LOOKAHEAD = 150.0 -- metres; far enough to brake comfortably from highway speed
 local warnedNoLiveTrafficLightState = false
 local REGISTER_SCAN_INTERVAL = 3.0 -- seconds between automatic re-scans for newly spawned vehicles
 local timeSinceLastScan = math.huge -- forces an immediate scan on the first onUpdate
+local AVOIDANCE_PARAMS = avoidance.defaultParams
 
 -- Maps a level name (as returned by path.levelFromPath) to a bundled road
 -- graph shipped inside this mod, for fully automatic setup -- no console
@@ -77,6 +96,12 @@ function M.setEnabled(value)
   M.enabled = value and true or false
 end
 
+-- Opt-in switch for the experimental lateral avoidance maneuver -- see the
+-- header comment above. Off by default even when M.enabled is on.
+function M.setAvoidanceEnabled(value)
+  M.avoidanceEnabled = value and true or false
+end
+
 -- CONFIRMED against the actual installed game's source (lua/vehicle/ai.lua):
 -- ai.setSpeed(speed) takes ONLY the number -- the 'limit' vs 'set' vs 'legal'
 -- behaviour is a *separate* call, ai.setSpeedMode(mode), gating whether/how
@@ -100,6 +125,7 @@ local function trackVehicle(vehId)
     trackedVehicles[vehId] = {
       profile = driverProfile.generate(),
       junctionDecision = { junctionId = nil, obeys = true },
+      avoidanceState = avoidance.newState(),
     }
   end
   initSpeedControl(vehId)
@@ -136,6 +162,53 @@ end
 -- (see initSpeedControl above), otherwise ai.lua ignores routeSpeed.
 local function dispatchSpeed(vehObj, speedMs)
   vehObj:queueLuaCommand(string.format("ai.setSpeed(%f)", speedMs))
+end
+
+-- ai.laneChange(plan, dist, signedDisp) -- confirmed exported (lua/vehicle/ai.lua,
+-- M.laneChange = laneChange), defaults `plan` to the vehicle's own currentRoute.plan
+-- when passed nil, so it can be dispatched exactly like this from the outside.
+-- EXPERIMENTAL -- see header comment.
+local function dispatchLaneChange(vehObj, signedOffset)
+  vehObj:queueLuaCommand(string.format("ai.laneChange(nil, %f, %f)", AVOIDANCE_PARAMS.maneuverDistance, signedOffset))
+end
+
+-- Runs the experimental avoidance state machine for one vehicle and performs
+-- the ai.laneChange side effect the pure state machine (avoidance.lua) asks
+-- for. distanceMovedThisTick is approximated as speed * dt (no extra position
+-- history needed). Returns the (possibly nil'd out) vehGap/vehLeaderSpeed to
+-- use for IDM: while a maneuver is in progress, the original obstacle is
+-- suppressed as a constraint (we're going around it, not stopping for it) --
+-- the traffic-light constraint is untouched and always still applies.
+local function updateAvoidance(vehState, segment, ownProj, positionsById, ownVehId, ownSpeed, vehGap, vehLeaderSpeed, dtSim)
+  local state = vehState.avoidanceState
+  local wantsToAvoid = false
+
+  if state.phase == avoidance.IDLE and mobil.shouldAttemptObstacleAvoidance(vehGap, vehLeaderSpeed) then
+    local otherPositions = {}
+    for otherId, otherData in pairs(positionsById) do
+      if otherId ~= ownVehId then
+        table.insert(otherPositions, otherData.pos)
+      end
+    end
+    wantsToAvoid = roadGraph.isOffsetPathClear(
+      segment, ownProj, AVOIDANCE_PARAMS.offsetMetres, AVOIDANCE_PARAMS.maneuverDistance, otherPositions)
+  end
+
+  local distanceMoved = ownSpeed * dtSim
+  local action = avoidance.update(state, dtSim, distanceMoved, wantsToAvoid, 1, AVOIDANCE_PARAMS)
+
+  if action == "beginOffset" then
+    log("I", "beamai_core", "vehicle " .. tostring(ownVehId) .. ": beginning avoidance maneuver")
+    dispatchLaneChange(positionsById[ownVehId].obj, AVOIDANCE_PARAMS.offsetMetres * state.sign)
+  elseif action == "returnToCentre" then
+    log("I", "beamai_core", "vehicle " .. tostring(ownVehId) .. ": returning to lane centre")
+    dispatchLaneChange(positionsById[ownVehId].obj, -AVOIDANCE_PARAMS.offsetMetres * state.sign)
+  end
+
+  if state.phase ~= avoidance.IDLE then
+    return nil, nil -- mid-maneuver: stop treating the original obstacle as a speed constraint
+  end
+  return vehGap, vehLeaderSpeed
 end
 
 -- Finds the closest other tracked vehicle plausibly ahead of `ownProj` on the
@@ -263,6 +336,12 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     if segment and ownProj then
       local vehState = trackedVehicles[vehId]
       local vehGap, vehLeaderSpeed = findLeaderOnSegment(segment, vehId, ownProj, positionsById)
+
+      if M.avoidanceEnabled then
+        vehGap, vehLeaderSpeed = updateAvoidance(
+          vehState, segment, ownProj, positionsById, vehId, data.speed, vehGap, vehLeaderSpeed, dtSim)
+      end
+
       local lightGap = findStopLineConstraint(M.graph, segment, ownProj, vehState)
 
       -- Whichever obstacle is nearer along the path is the binding constraint

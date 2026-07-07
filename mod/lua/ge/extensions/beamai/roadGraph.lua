@@ -202,6 +202,43 @@ function M.findNearestSegment(graph, point)
   return bestSeg, bestProj
 end
 
+-- Perpendicular (horizontal-plane) direction at a projection, assuming a
+-- Z-up world (BeamNG convention): rotate the tangent 90 degrees around Z.
+-- The sign (which side is "left" vs "right") is not confirmed in-game yet --
+-- see avoidance usage in core.lua.
+function M.lateralDirectionAtProjection(nodes, proj)
+  local t = M.tangentAtProjection(nodes, proj)
+  return M.normalize({ -t[2], t[1], 0 })
+end
+
+-- Checks whether shifting `lateralOffset` metres sideways from `ownProj`, over
+-- the next `maneuverDistance` metres of travel, would come within
+-- `minClearance` of any position in `otherPositions` (list of {x,y,z}) --
+-- i.e. whether an avoidance maneuver into that offset is currently safe.
+-- Pure geometry, no BeamNG dependency -- unit tested standalone.
+function M.isOffsetPathClear(segment, ownProj, lateralOffset, maneuverDistance, otherPositions, minClearance)
+  minClearance = minClearance or 2.5
+  local tangent = M.tangentAtProjection(segment.nodes, ownProj)
+  local lateral = M.lateralDirectionAtProjection(segment.nodes, ownProj)
+  local base = ownProj.point
+
+  for _, otherPos in ipairs(otherPositions) do
+    local rel = { otherPos[1] - base[1], otherPos[2] - base[2], otherPos[3] - base[3] }
+    local alongDist = vdot(rel, tangent)
+    if alongDist >= -minClearance and alongDist <= maneuverDistance + minClearance then
+      local target = {
+        base[1] + tangent[1] * alongDist + lateral[1] * lateralOffset,
+        base[2] + tangent[2] * alongDist + lateral[2] * lateralOffset,
+        base[3] + tangent[3] * alongDist + lateral[3] * lateralOffset,
+      }
+      if vlen(vsub(otherPos, target)) < minClearance then
+        return false
+      end
+    end
+  end
+  return true
+end
+
 local DEFAULT_MIN_SPEED_FOR_HEADING_CHECK = 1.0 -- m/s; below this, treat as a stationary obstacle regardless of heading
 local DEFAULT_MIN_HEADING_ALIGNMENT = 0.5 -- cos(60 deg): must be moving roughly the same way to count as "in our lane"
 
