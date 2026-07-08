@@ -216,13 +216,20 @@ local M = {}
 
 M.enabled = false
 -- ON by default: obstacle avoidance for native-driven vehicles
--- (updateNativeAvoidance) boosts native's own side_avoidance responsiveness
--- via ai.setParameters({awarenessForceCoef=...}) -- confirmed working by
--- direct in-game testing ("oui il esquive"), unlike ai.laneChange or
--- ai.driveUsingPath's routeOffset (neither actually does anything in this
--- game version -- see updateNativeAvoidance's header comment).
--- Rollback without touching anything else: setAvoidanceEnabled(false).
-M.avoidanceEnabled = true
+-- OFF by default as of this revision -- reverted alongside
+-- M.junctionPriorityEnabled below after a severe, confirmed in-game
+-- regression (FPS 100 -> 20, every vehicle crawling at ~15 km/h everywhere)
+-- on the first session where this mod's activation itself actually worked.
+-- The underlying technique (updateNativeAvoidance boosting native's own
+-- side_avoidance via ai.setParameters({awarenessForceCoef=...})) was
+-- separately confirmed working in an earlier, isolated in-game test ("oui il
+-- esquive"), so it's a less likely root cause than the newer, never-live-
+-- tested junction priority system -- but reverted to off here too, to give
+-- a clean, minimal, working baseline while the real cause is isolated one
+-- toggle at a time rather than leaving two newly-reactivated systems on
+-- simultaneously. Turn back on with setAvoidanceEnabled(true) once
+-- junction priority has been cleared or fixed.
+M.avoidanceEnabled = false
 M.fullControlEnabled = false
 M.autoScanEnabled = true
 -- Whether onClientStartMission switches straight to full custom control for
@@ -255,12 +262,23 @@ M.routingIndex = nil
 -- (roadGraph.findLookaheadPoint, which just aims at any real junction it
 -- meets). ON by default per explicit request -- see M.setRoutingEnabled.
 M.routingEnabled = true
--- Whether stop/yield priority at real (non-signalized) junctions is enforced
--- (findJunctionPriorityConstraint) -- see M.setJunctionPriorityEnabled. ON by
--- default, separate switch from M.routingEnabled: this affects whether a
--- vehicle stops/yields, routing affects which branch it takes: independent
--- concerns, independent rollback.
-M.junctionPriorityEnabled = true
+-- OFF by default as of this revision -- reverted after a severe, confirmed
+-- in-game regression on the FIRST session where activation itself actually
+-- worked (every earlier test of this feature had activation silently broken,
+-- so it had never really been exercised live before): FPS 100 -> 20, and
+-- every vehicle crawling at ~15 km/h regardless of road type, including deep
+-- in a highway tunnel far from any real intersection. Root cause not yet
+-- isolated -- prime suspects: west_coast_usa has 337 real junctions (194 of
+-- them all-way-stop) packed into only 1303 segments, so MAX_LIGHT_LOOKAHEAD
+-- (150m) may mean a vehicle is almost never actually clear of an upcoming
+-- stop-priority junction, which combined with IDM could produce a
+-- persistent low-speed equilibrium that then propagates backward through
+-- following traffic via ordinary car-following -- or a real bug in
+-- findUpcomingPriorityJunction/walkToNextRealJunction (router.lua) returning
+-- a wrong/too-small distance. Kept available as an explicit opt-in
+-- (M.setJunctionPriorityEnabled(true)) for isolating the cause without
+-- forcing it on everyone by default while unresolved.
+M.junctionPriorityEnabled = false
 -- vehId -> { profile, junctionDecision = {junctionId, obeys}, avoidanceState = <avoidance state> }
 local trackedVehicles = {}
 local JUNCTION_SEARCH_RADIUS = 8.0 -- metres; matches the extractor's clustering radius (~6m) plus margin
