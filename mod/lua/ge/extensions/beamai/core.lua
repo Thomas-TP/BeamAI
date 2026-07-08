@@ -384,6 +384,29 @@ function M.unregisterVehicle(vehId)
   trackedVehicles[vehId] = nil
 end
 
+-- Debug/introspection: is this specific vehicle actually being driven by
+-- BeamAI right now (native ai.lua genuinely disabled on it), rather than
+-- just "tracked" in general? Console check:
+--   extensions.beamai_core.isVehicleUnderFullControl(12345)
+-- Returns false for an untracked id, or a tracked vehicle still on the
+-- legacy ai.setSpeed-only path (fullControlEnabled was off when it was
+-- registered).
+function M.isVehicleUnderFullControl(vehId)
+  local vehState = trackedVehicles[vehId]
+  return vehState ~= nil and vehState.aiDisabled == true
+end
+
+-- Debug/introspection: every vehicle id this mod is currently tracking, so
+-- you don't have to guess one to pass to isVehicleUnderFullControl. Console
+-- check: dump(extensions.beamai_core.getTrackedVehicleIds())
+function M.getTrackedVehicleIds()
+  local ids = {}
+  for vehId in pairs(trackedVehicles) do
+    table.insert(ids, vehId)
+  end
+  return ids
+end
+
 -- Switch for full custom control (own steering + own throttle/brake, ai.lua's
 -- own driving disabled entirely) -- see the header comment above. Applied
 -- automatically on map load by default (M.autoFullControlOnStart); this

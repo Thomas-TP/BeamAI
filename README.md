@@ -37,6 +37,25 @@ Chaque appel à l'API du jeu a été vérifié directement dans le code source d
 
 **Zéro commande console requise** : au chargement d'une carte pour laquelle un graphe est fourni (`west_coast_usa` aujourd'hui), le mod charge automatiquement son graphe et bascule **tout le trafic** (chaque véhicule sauf le tien) sur le pilotage complet maison — pas juste la vitesse. Lance le jeu, charge la carte, c'est tout. Ce comportement par défaut (`M.autoFullControlOnStart`) peut être désactivé sans relancer le jeu si besoin (`extensions.beamai_core.setAutoFullControlOnStart(false)` puis recharger la carte) pour retomber sur l'ancien pilotage vitesse-seule, plus prudent mais moins abouti.
 
+### Comment vérifier que c'est vraiment BeamAI qui pilote, pas l'IA native de BeamNG
+
+Trois façons de le confirmer, de la plus rapide à la plus solide :
+
+1. **État du mod, dans la console Lua (Game Engine)** :
+```lua
+dump(extensions.beamai_core.enabled)              -- doit être true
+dump(extensions.beamai_core.fullControlEnabled)   -- doit être true (sinon : ancien pilotage vitesse-seule)
+dump(extensions.beamai_core.routingEnabled)
+dump(extensions.beamai_core.junctionPriorityEnabled)
+```
+2. **Un véhicule précis est-il vraiment sous contrôle complet ?** (nouveau, pensé pour répondre exactement à cette question) :
+```lua
+dump(extensions.beamai_core.getTrackedVehicleIds())        -- liste des véhicules suivis par ce mod
+dump(extensions.beamai_core.isVehicleUnderFullControl(12345)) -- remplace par un des ids ci-dessus ; doit être true
+```
+`isVehicleUnderFullControl` renvoie `false` pour un véhicule non suivi, ou suivi mais encore sur l'ancien chemin `ai.setSpeed`. `true` veut dire que `ai.setMode('disabled')` a bien été envoyé à ce véhicule précis et que c'est nous qui lui injectons direction/accélérateur/frein.
+3. **Preuve comportementale, la plus parlante** : observe un véhicule à un **carrefour sans feu** (un vrai stop). L'IA native de BeamNG ne suit pas les panneaux stop/priorité (confirmé par la doc officielle, voir `docs/ARCHITECTURE.md` section 2.1) — elle ne s'arrête donc **jamais** à ce genre de carrefour. Si tu vois un véhicule s'arrêter complètement à un carrefour sans feu, même quand rien n'arrive en face, c'est forcément BeamAI qui le pilote : c'est un comportement que l'IA native ne sait pas produire.
+
 **Statut** :
 - ✅ **Validé en jeu — pilotage complet maison (direction + vitesse)** : confirmé par un vrai test grandeur nature, tout le trafic piloté par `steeringController.lua`/`speedController.lua`, plus aucune décision de `ai.lua`. C'est désormais le comportement par défaut.
 - ✅ **Validé en jeu — évitement d'obstacle en pilotage complet** : confirmé fonctionnel ("il esquive"). Un bug a ensuite été trouvé et corrigé : `isOffsetPathClear` incluait l'obstacle lui-même dans sa propre vérification de dégagement, ce qui faisait échouer la manœuvre (et donc freiner jusqu'à l'arrêt au lieu de contourner) dans la plupart des cas plutôt que de rater juste les cas vraiment bloqués — corrigé, pas encore re-testé en jeu depuis le correctif.
