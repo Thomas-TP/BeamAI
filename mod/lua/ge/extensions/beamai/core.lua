@@ -215,7 +215,14 @@ local router = require("beamai/router")
 local M = {}
 
 M.enabled = false
-M.avoidanceEnabled = false
+-- ON by default: obstacle avoidance for native-driven vehicles
+-- (updateNativeAvoidance) boosts native's own side_avoidance responsiveness
+-- via ai.setParameters({awarenessForceCoef=...}) -- confirmed working by
+-- direct in-game testing ("oui il esquive"), unlike ai.laneChange or
+-- ai.driveUsingPath's routeOffset (neither actually does anything in this
+-- game version -- see updateNativeAvoidance's header comment).
+-- Rollback without touching anything else: setAvoidanceEnabled(false).
+M.avoidanceEnabled = true
 M.fullControlEnabled = false
 M.autoScanEnabled = true
 -- Whether onClientStartMission switches straight to full custom control for
@@ -300,12 +307,11 @@ function M.setEnabled(value)
   M.enabled = value and true or false
 end
 
--- Opt-in switch for the lateral avoidance maneuver -- see the header comment
--- above. Off by default even when M.enabled is on. Under full control (see
--- M.setFullControlEnabled), this drives a lateral offset of our own
--- pure-pursuit lookahead target (updateFullControlAvoidance) instead of
--- nudging ai.lua's native side-avoidance, which isn't running anymore once
--- ai.setMode('disabled') has been sent.
+-- Switch for the lateral avoidance maneuver -- see the header comment above.
+-- ON by default. Native-driven vehicles (the default path) boost native's
+-- own side_avoidance responsiveness (updateNativeAvoidance). Under full
+-- control (see M.setFullControlEnabled), this instead drives a lateral
+-- offset of our own pure-pursuit lookahead target (updateFullControlAvoidance).
 function M.setAvoidanceEnabled(value)
   M.avoidanceEnabled = value and true or false
 end
@@ -496,40 +502,6 @@ local function dispatchControls(vehObj, steeringVal, throttleVal, brakeVal)
     steeringVal, throttleVal, brakeVal))
 end
 
--- ai.setParameters(data) -- confirmed exported (lua/vehicle/ai.lua). Used here
--- only to dial the native side-avoidance's own responsiveness
--- (parameters.awarenessForceCoef) up while easing past a close obstacle and
--- back down to the default afterwards -- never to compute a trajectory
--- ourselves (see header comment for why).
-local function dispatchAwareness(vehObj, coef)
-  vehObj:queueLuaCommand(string.format("ai.setParameters({awarenessForceCoef = %f})", coef))
-end
-
--- Runs the creep-past state machine for one vehicle (avoidance.lua's state
--- machine, reused for its timing/hysteresis only -- see header comment for
--- why this no longer computes its own lateral offset). Returns the (possibly
--- nil'd out) vehGap/vehLeaderSpeed for IDM, and whether the caller should cap
--- the desired speed to a cautious creep while this is active.
-local function updateAvoidance(vehState, ownVehId, ownObj, vehGap, vehLeaderSpeed, ownSpeed, dtSim)
-  local state = vehState.avoidanceState
-  local wantsToAvoid = state.phase == avoidance.IDLE and mobil.shouldAttemptObstacleAvoidance(vehGap, vehLeaderSpeed)
-
-  local distanceMoved = ownSpeed * dtSim
-  local action = avoidance.update(state, dtSim, distanceMoved, wantsToAvoid, 1, AVOIDANCE_PARAMS)
-
-  if action == "beginOffset" then
-    log("I", "beamai_core", "vehicle " .. tostring(ownVehId) .. ": easing past a close, slow obstacle")
-    dispatchAwareness(ownObj, BOOSTED_AWARENESS_COEF)
-  elseif action == "returnToCentre" then
-    dispatchAwareness(ownObj, DEFAULT_AWARENESS_COEF)
-  end
-
-  if state.phase ~= avoidance.IDLE then
-    return nil, nil, true -- suppress the hard-stop constraint; caller applies a creep-speed cap instead
-  end
-  return vehGap, vehLeaderSpeed, false
-end
-
 -- Plain list of {x,y,z} for every tracked vehicle except `ownVehId` and
 -- `leaderVehId` -- the shape roadGraph.isOffsetPathClear expects. Excluding
 -- the leader is not optional: it's the very obstacle we're checking whether
@@ -551,6 +523,53 @@ local function buildOtherPositionsList(positionsById, ownVehId, leaderVehId)
   return list
 end
 
+-- CORRECTION, caught before shipping: an earlier version of this function
+-- used ai.driveUsingPath({routeOffset=X, avoidCars=...}), a technique copied
+-- from reading a real, shipped community mod
+-- (github.com/twiks228/Advancedtrafficaibeamg). That mod targets BeamNG
+-- 0.38.3; checking OUR installed game's own lua/vehicle/ai.lua directly
+-- (the driveUsingPath(arg) function, ~line 6702) shows its argument
+-- validation requires arg.path, arg.wpTargetList, or arg.script to be a
+-- table, or the function returns immediately doing nothing -- and there is
+-- no `routeOffset` key anywhere in ai.lua at all in this version. Calling it
+-- the way that mod does would have silently no-op'd every time, exactly
+-- like the earlier ai.laneChange dead end. Reverted to the technique
+-- already empirically confirmed working by direct in-game testing earlier
+-- in this project ("oui il esquive"): temporarily boosting native's own
+-- continuous side-avoidance responsiveness via
+-- ai.setParameters({awarenessForceCoef=...}) -- confirmed real and exported
+-- -- and letting native ai.lua's own side_avoidance (active whenever
+-- avoidCars=='on', the default) work out the actual lateral maneuver and
+-- clearance itself, rather than us computing our own offset/clearance for a
+-- native-driven vehicle.
+local function dispatchAwareness(vehObj, coef)
+  vehObj:queueLuaCommand(string.format("ai.setParameters({awarenessForceCoef = %f})", coef))
+end
+
+-- Runs the creep-past state machine for one vehicle (avoidance.lua's state
+-- machine, reused for its timing/hysteresis only -- native's own
+-- side_avoidance computes the actual lateral offset and clearance, we only
+-- decide when to boost its responsiveness and for how long).
+local function updateNativeAvoidance(vehState, ownVehId, vehObj, vehGap, vehLeaderSpeed, ownSpeed, dtSim)
+  local state = vehState.avoidanceState
+  local wantsToAvoid = state.phase == avoidance.IDLE and mobil.shouldAttemptObstacleAvoidance(vehGap, vehLeaderSpeed)
+
+  local distanceMoved = ownSpeed * dtSim
+  local action = avoidance.update(state, dtSim, distanceMoved, wantsToAvoid, 1, AVOIDANCE_PARAMS)
+
+  if action == "beginOffset" then
+    log("I", "beamai_core", "vehicle " .. tostring(ownVehId) .. ": easing past a close, slow obstacle")
+    dispatchAwareness(vehObj, BOOSTED_AWARENESS_COEF)
+  elseif action == "returnToCentre" then
+    dispatchAwareness(vehObj, DEFAULT_AWARENESS_COEF)
+  end
+
+  if state.phase ~= avoidance.IDLE then
+    return nil, nil, true -- suppress the hard-stop constraint; caller applies a creep-speed cap instead
+  end
+  return vehGap, vehLeaderSpeed, false
+end
+
 -- Same idea as buildOtherPositionsList, but keeps each vehicle's speed too --
 -- needed by roadGraph.isCrossTrafficNearJunction (a near-stationary vehicle
 -- already waiting/parked near a junction shouldn't block a yield). Only
@@ -565,11 +584,11 @@ local function buildOtherPositionsWithSpeed(positionsById, ownVehId, leaderVehId
   return list
 end
 
--- Full-control equivalent of updateAvoidance (below): there is no native
--- side-avoidance to nudge anymore once ai.setMode('disabled') has been sent,
--- so this instead drives a continuous signed lateral offset (metres) of our
--- own pure-pursuit lookahead point (roadGraph.offsetPointLateral, applied by
--- the caller) -- the car steers toward a laterally-shifted target rather than
+-- Full-control equivalent of updateNativeAvoidance (above): there is no
+-- native side_avoidance left to boost once ai.setMode('disabled') has been
+-- sent, so this instead drives a continuous signed lateral offset (metres)
+-- of our own pure-pursuit lookahead point (roadGraph.offsetPointLateral,
+-- applied by the caller) -- the car steers toward a laterally-shifted target rather than
 -- the raw path centreline. The side (left/right) is chosen only once, at the
 -- moment the maneuver starts, by checking which offset direction is actually
 -- clear of the other tracked vehicles right now (roadGraph.isOffsetPathClear,
@@ -950,12 +969,15 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
       local entryEnd = guessEntryEnd(segment, ownProj, data.heading)
       local vehGap, vehLeaderSpeed, vehLeaderId = findLeaderOnSegment(segment, vehId, ownProj, positionsById)
 
-      -- Under full control there's no native side_avoidance left to nudge (it
+      -- Under full control there's no native path-following left to nudge (it
       -- stopped running once ai.setMode('disabled') was sent), so avoidance
       -- there instead offsets our own steering target laterally
-      -- (updateFullControlAvoidance). The legacy path (updateAvoidance) still
-      -- boosts ai.lua's native awarenessForceCoef, only for vehicles NOT under
-      -- full control.
+      -- (updateFullControlAvoidance). Native-driven vehicles instead boost
+      -- native's own side_avoidance responsiveness (updateNativeAvoidance,
+      -- ai.setParameters({awarenessForceCoef=...})) -- confirmed working by
+      -- direct in-game testing, unlike ai.laneChange or routeOffset (see
+      -- updateNativeAvoidance's header comment for why routeOffset doesn't
+      -- work in this game version despite appearing to in a reference mod).
       local isCreepingPastObstacle = false
       local lateralOffsetMetres = 0
       if M.avoidanceEnabled then
@@ -963,7 +985,7 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
           vehGap, vehLeaderSpeed, isCreepingPastObstacle, lateralOffsetMetres = updateFullControlAvoidance(
             vehState, vehId, vehLeaderId, segment, ownProj, vehGap, vehLeaderSpeed, data.speed, dtSim, positionsById)
         else
-          vehGap, vehLeaderSpeed, isCreepingPastObstacle = updateAvoidance(
+          vehGap, vehLeaderSpeed, isCreepingPastObstacle = updateNativeAvoidance(
             vehState, vehId, data.obj, vehGap, vehLeaderSpeed, data.speed, dtSim)
         end
       end

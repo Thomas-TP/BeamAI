@@ -46,6 +46,8 @@ if ok then
   check("starts disabled", core.enabled == false)
   check("full control defaults to OFF (native ai.lua drives by default -- see core.lua header comment)",
     core.autoFullControlOnStart == false)
+  check("setAvoidanceEnabled is a function", type(core.setAvoidanceEnabled) == "function")
+  check("avoidance defaults to on (awarenessForceCoef boost, confirmed working in-game)", core.avoidanceEnabled == true)
   check("routing defaults to on", core.routingEnabled == true)
   check("junction priority defaults to on", core.junctionPriorityEnabled == true)
   check("no routing index until a graph is loaded", core.routingIndex == nil)
