@@ -279,6 +279,27 @@ M.routingEnabled = true
 -- (M.setJunctionPriorityEnabled(true)) for isolating the cause without
 -- forcing it on everyone by default while unresolved.
 M.junctionPriorityEnabled = false
+-- OFF by default too, TEMPORARILY, as the next diagnostic step: disabling
+-- both avoidance and junction priority produced ZERO change to the reported
+-- regression (still ~15 km/h everywhere, still ~20 FPS), which rules them
+-- out and points at whatever still runs completely unconditionally --
+-- findStopLineConstraint (traffic light lookahead) was the only such path
+-- left. It correlates with a real, observed log line: "could not read live
+-- traffic light state" -- trafficLights.isStopState fails safe by treating
+-- an unreadable light as red, never green (docs/ARCHITECTURE.md section
+-- 4.5), so if that live-state read is failing systematically (not just
+-- once), EVERY one of west_coast_usa's ~130 traffic lights would look
+-- permanently red to every vehicle, forcing a perpetual approach-and-crawl
+-- cycle from light to light instead of ever reaching cruising speed. This
+-- exact lookahead was rewritten this session (router.findUpcomingTrafficLight,
+-- for performance) and has not been re-validated in-game since -- the
+-- original, pre-rewrite version WAS validated successfully in the very
+-- first playtest of this whole project. Disabling this now isolates whether
+-- the regression is in this lookahead specifically (rewritten, unverified)
+-- or somewhere even more fundamental (car-following/speed-limit dispatch,
+-- unchanged since the first validated playtest). Turn back on with
+-- setTrafficLightEnabled(true) once isolated.
+M.trafficLightEnabled = false
 -- vehId -> { profile, junctionDecision = {junctionId, obeys}, avoidanceState = <avoidance state> }
 local trackedVehicles = {}
 local JUNCTION_SEARCH_RADIUS = 8.0 -- metres; matches the extractor's clustering radius (~6m) plus margin
@@ -371,6 +392,12 @@ end
 -- turns out to be the culprit for a specific issue, without losing routing.
 function M.setJunctionPriorityEnabled(value)
   M.junctionPriorityEnabled = value and true or false
+end
+
+-- Diagnostic toggle, see M.trafficLightEnabled above for why this exists and
+-- what it's isolating. Turn back on once the regression is understood.
+function M.setTrafficLightEnabled(value)
+  M.trafficLightEnabled = value and true or false
 end
 
 -- CONFIRMED against the actual installed game's source (lua/vehicle/ai.lua):
@@ -1008,7 +1035,10 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         end
       end
 
-      local lightGap = findStopLineConstraint(M.routingIndex, segment, entryEnd, ownProj, vehState)
+      local lightGap = nil
+      if M.trafficLightEnabled then
+        lightGap = findStopLineConstraint(M.routingIndex, segment, entryEnd, ownProj, vehState)
+      end
       local junctionGap = nil
       if M.junctionPriorityEnabled then
         junctionGap = findJunctionPriorityConstraint(

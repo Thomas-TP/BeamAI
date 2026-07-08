@@ -52,6 +52,9 @@ if ok then
   check("routing defaults to on", core.routingEnabled == true)
   check("junction priority defaults to OFF (reverted after a confirmed FPS/speed regression -- see core.lua header comment)",
     core.junctionPriorityEnabled == false)
+  check("setTrafficLightEnabled is a function", type(core.setTrafficLightEnabled) == "function")
+  check("traffic light lookahead defaults to OFF (diagnostic step -- see core.lua header comment)",
+    core.trafficLightEnabled == false)
   check("no routing index until a graph is loaded", core.routingIndex == nil)
 else
   print("  error: " .. tostring(core))
