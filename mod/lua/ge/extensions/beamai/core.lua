@@ -308,6 +308,22 @@ local warnedNoLiveTrafficLightState = false
 local REGISTER_SCAN_INTERVAL = 3.0 -- seconds between automatic re-scans for newly spawned vehicles
 local MAX_ROUTE_PLANS_PER_TICK = 2 -- caps how many A* searches (router.findRoute) run in a single onUpdate tick
 local timeSinceLastScan = math.huge -- forces an immediate scan on the first onUpdate
+-- Throttles the whole per-vehicle pipeline (position reads, IDM, dispatchSpeed)
+-- to at most 10 times per second, instead of running it on every single call
+-- of the GE Lua onUpdate hook -- whose real call rate relative to render FPS
+-- was never confirmed or throttled before this. Found by finally reading a
+-- reference mod's own core update loop (github.com/twiks228/Advancedtrafficaibeamg,
+-- trafficAICore.lua): it does exactly this (accumulate dtSim, bail out until
+-- UPDATE_INTERVAL_S has passed), while ours ran its full loop unconditionally
+-- on every call. If onUpdate fires faster than needed, that multiplies the
+-- real per-tick cost far beyond what's necessary, AND floods each vehicle's
+-- own Lua VM with far more ai.setSpeed() calls per second than it needs --
+-- a very plausible explanation for both the confirmed FPS drop and vehicles
+-- crawling at an oddly uniform low speed regardless of road type, since
+-- neither symptom went away when avoidance/junction-priority/traffic-light
+-- lookahead were all disabled (none of those touch this).
+local UPDATE_INTERVAL_S = 0.1
+local updateAccumTime = 0
 local AVOIDANCE_PARAMS = avoidance.defaultParams
 local CREEP_SPEED_MS = 3.0 -- ~11 km/h; cautious speed while easing past a close obstacle
 local DEFAULT_AWARENESS_COEF = 0.25 -- lua/vehicle/ai.lua's own default for parameters.awarenessForceCoef
@@ -595,12 +611,12 @@ end
 -- machine, reused for its timing/hysteresis only -- native's own
 -- side_avoidance computes the actual lateral offset and clearance, we only
 -- decide when to boost its responsiveness and for how long).
-local function updateNativeAvoidance(vehState, ownVehId, vehObj, vehGap, vehLeaderSpeed, ownSpeed, dtSim)
+local function updateNativeAvoidance(vehState, ownVehId, vehObj, vehGap, vehLeaderSpeed, ownSpeed, dt)
   local state = vehState.avoidanceState
   local wantsToAvoid = state.phase == avoidance.IDLE and mobil.shouldAttemptObstacleAvoidance(vehGap, vehLeaderSpeed)
 
-  local distanceMoved = ownSpeed * dtSim
-  local action = avoidance.update(state, dtSim, distanceMoved, wantsToAvoid, 1, AVOIDANCE_PARAMS)
+  local distanceMoved = ownSpeed * dt
+  local action = avoidance.update(state, dt, distanceMoved, wantsToAvoid, 1, AVOIDANCE_PARAMS)
 
   if action == "beginOffset" then
     log("I", "beamai_core", "vehicle " .. tostring(ownVehId) .. ": easing past a close, slow obstacle")
@@ -641,7 +657,7 @@ end
 -- this tick and the vehicle just keeps a safe IDM gap behind the obstacle
 -- until an opening appears. Same idle/offsetting/returning timing/hysteresis
 -- as the legacy path (avoidance.lua), reused unchanged.
-local function updateFullControlAvoidance(vehState, ownVehId, leaderVehId, segment, ownProj, vehGap, vehLeaderSpeed, ownSpeed, dtSim, positionsById)
+local function updateFullControlAvoidance(vehState, ownVehId, leaderVehId, segment, ownProj, vehGap, vehLeaderSpeed, ownSpeed, dt, positionsById)
   local state = vehState.avoidanceState
   local wantsToAvoid = false
   local offsetSign = state.sign
@@ -658,8 +674,8 @@ local function updateFullControlAvoidance(vehState, ownVehId, leaderVehId, segme
     -- else: neither side clear right now -- stay idle, IDM keeps a safe gap and we retry next tick
   end
 
-  local distanceMoved = ownSpeed * dtSim
-  avoidance.update(state, dtSim, distanceMoved, wantsToAvoid, offsetSign, AVOIDANCE_PARAMS)
+  local distanceMoved = ownSpeed * dt
+  avoidance.update(state, dt, distanceMoved, wantsToAvoid, offsetSign, AVOIDANCE_PARAMS)
   local lateralOffsetMetres = avoidance.currentOffsetMetres(state, AVOIDANCE_PARAMS)
 
   if state.phase ~= avoidance.IDLE then
@@ -955,10 +971,21 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     return
   end
 
+  -- See UPDATE_INTERVAL_S's own header comment above for why this exists.
+  -- Everything below uses `dt` (the real elapsed time since the last
+  -- processed update, potentially several onUpdate calls' worth of dtSim
+  -- accumulated), never the raw per-call dtSim.
+  updateAccumTime = updateAccumTime + dtSim
+  if updateAccumTime < UPDATE_INTERVAL_S then
+    return
+  end
+  local dt = updateAccumTime
+  updateAccumTime = 0
+
   -- Automatically pick up newly spawned/despawned vehicles every few seconds,
   -- so nobody has to call registerAll() by hand after spawning traffic.
   if M.autoScanEnabled then
-    timeSinceLastScan = timeSinceLastScan + dtSim
+    timeSinceLastScan = timeSinceLastScan + dt
     if timeSinceLastScan >= REGISTER_SCAN_INTERVAL then
       timeSinceLastScan = 0
       M.registerAll()
@@ -1028,10 +1055,10 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
       if M.avoidanceEnabled then
         if M.fullControlEnabled then
           vehGap, vehLeaderSpeed, isCreepingPastObstacle, lateralOffsetMetres = updateFullControlAvoidance(
-            vehState, vehId, vehLeaderId, segment, ownProj, vehGap, vehLeaderSpeed, data.speed, dtSim, positionsById)
+            vehState, vehId, vehLeaderId, segment, ownProj, vehGap, vehLeaderSpeed, data.speed, dt, positionsById)
         else
           vehGap, vehLeaderSpeed, isCreepingPastObstacle = updateNativeAvoidance(
-            vehState, vehId, data.obj, vehGap, vehLeaderSpeed, data.speed, dtSim)
+            vehState, vehId, data.obj, vehGap, vehLeaderSpeed, data.speed, dt)
         end
       end
 
@@ -1064,7 +1091,7 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         idmParams.desiredSpeed = math.min(idmParams.desiredSpeed, CREEP_SPEED_MS)
       end
 
-      local targetSpeed = idm.nextSpeed(data.speed, leaderSpeed or 0, gap, dtSim, idmParams)
+      local targetSpeed = idm.nextSpeed(data.speed, leaderSpeed or 0, gap, dt, idmParams)
 
       local mergeSpeedCap = playerMergeSpeedCap(segment, ownProj, data, playerPos, playerVehId, vehId)
       if mergeSpeedCap then
@@ -1103,7 +1130,7 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
           target = roadGraph.offsetPointLateral(target, lateralDir, lateralOffsetMetres)
         end
         local steeringVal = steeringController.computeSteering(data.pos, data.heading, target)
-        local throttleVal, brakeVal = speedController.compute(vehState.speedControllerState, data.speed, targetSpeed, dtSim)
+        local throttleVal, brakeVal = speedController.compute(vehState.speedControllerState, data.speed, targetSpeed, dt)
         dispatchControls(data.obj, steeringVal, throttleVal, brakeVal)
       else
         dispatchSpeed(data.obj, targetSpeed)
