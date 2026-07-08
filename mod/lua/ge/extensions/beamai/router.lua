@@ -33,6 +33,60 @@ local function dist3(a, b)
   return math.sqrt(dx * dx + dy * dy + dz * dz)
 end
 
+-- Minimal binary min-heap keyed by item.f, backing findRoute's open set
+-- below. Tolerates stale/duplicate entries for the same node (the caller
+-- discards them after popping, by checking `visited` -- the same "lazy
+-- deletion" approach a plain linear-scan queue would use, just with O(log n)
+-- push/pop instead of an O(n) rescan for the minimum on every single
+-- iteration. That rescan was a real, confirmed in-game performance bug: on
+-- west_coast_usa's ~1300-segment graph, a route to a genuinely distant
+-- random destination could expand a queue of hundreds of entries, rescanned
+-- in full on every pop -- observed to drop the game from 120 to 25 FPS the
+-- moment several vehicles needed a route at once (right after registerAll()
+-- during the very first tick of an automatic activation).
+local function heapPush(heap, item)
+  local n = #heap + 1
+  heap[n] = item
+  while n > 1 do
+    -- math.floor(n/2), not the // operator: BeamNG's embedded Lua version
+    -- isn't confirmed to support Lua 5.3+ integer division syntax, and
+    -- math.floor works identically on every Lua version.
+    local parent = math.floor(n / 2)
+    if heap[parent].f <= heap[n].f then
+      break
+    end
+    heap[parent], heap[n] = heap[n], heap[parent]
+    n = parent
+  end
+end
+
+local function heapPop(heap)
+  local n = #heap
+  if n == 0 then
+    return nil
+  end
+  local top = heap[1]
+  heap[1] = heap[n]
+  heap[n] = nil
+  n = n - 1
+  local i = 1
+  while true do
+    local left, right, smallest = i * 2, i * 2 + 1, i
+    if left <= n and heap[left].f < heap[smallest].f then
+      smallest = left
+    end
+    if right <= n and heap[right].f < heap[smallest].f then
+      smallest = right
+    end
+    if smallest == i then
+      break
+    end
+    heap[i], heap[smallest] = heap[smallest], heap[i]
+    i = smallest
+  end
+  return top
+end
+
 local function segEndpoints(seg)
   local nodes = seg.nodes
   local first, last = nodes[1], nodes[#nodes]
@@ -169,9 +223,9 @@ end
 -- traversal of goalSegId. Cost = travelled road distance (roadGraph.segmentLength),
 -- heuristic = straight-line distance from the far end of the current segment
 -- to the goal's midpoint (admissible: real road distance is never shorter
--- than a straight line). Priority queue is a plain linear scan -- fine for an
--- occasional route request on graphs of this size (~1300 segments), not
--- meant to run every tick.
+-- than a straight line). Priority queue is a binary min-heap (heapPush/heapPop
+-- above) -- see their header comment for why a plain linear scan here was a
+-- real, confirmed in-game performance bug, not just a theoretical concern.
 --
 -- Returns an ordered list of { segId, entryEnd } traversal steps from start
 -- to goal (inclusive), or nil if unreachable.
@@ -201,20 +255,14 @@ function M.findRoute(index, startSegId, startEntryEnd, goalSegId)
   local gScore = {}       -- key -> best known cost from start
   local cameFrom = {}     -- key -> { segId, entryEnd } of the predecessor step
   local visited = {}      -- key -> true once expanded
-  local queue = {}         -- open set, linear-scanned for the lowest f each iteration
+  local queue = {}        -- open set: binary min-heap on .f, may hold stale duplicate entries (see heapPop)
 
   local startKey = key(startSegId, startEntryEnd)
   gScore[startKey] = 0
-  table.insert(queue, { segId = startSegId, entryEnd = startEntryEnd, key = startKey, f = heuristic(startSegId, startEntryEnd) })
+  heapPush(queue, { segId = startSegId, entryEnd = startEntryEnd, key = startKey, f = heuristic(startSegId, startEntryEnd) })
 
   while #queue > 0 do
-    local bestIdx = 1
-    for i = 2, #queue do
-      if queue[i].f < queue[bestIdx].f then
-        bestIdx = i
-      end
-    end
-    local current = table.remove(queue, bestIdx)
+    local current = heapPop(queue)
 
     if not visited[current.key] then
       visited[current.key] = true
@@ -237,7 +285,7 @@ function M.findRoute(index, startSegId, startEntryEnd, goalSegId)
         if gScore[nk] == nil or g < gScore[nk] then
           gScore[nk] = g
           cameFrom[nk] = { segId = current.segId, entryEnd = current.entryEnd }
-          table.insert(queue, { segId = n.segId, entryEnd = n.entryEnd, key = nk, f = g + heuristic(n.segId, n.entryEnd) })
+          heapPush(queue, { segId = n.segId, entryEnd = n.entryEnd, key = nk, f = g + heuristic(n.segId, n.entryEnd) })
         end
       end
     end

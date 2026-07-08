@@ -127,8 +127,22 @@
 -- does *nothing at all*: onUpdate's very first line returns immediately
 -- because M.enabled/M.graph are still unset, and no vehicle ever had
 -- ai.setMode('disabled') sent to it. Whatever driving was observed in that
--- state was still 100% native BeamNG AI. Loading the map fresh (not just
--- reloading the extension) is what actually exercises the default above.
+-- state was still 100% native BeamNG AI.
+--
+-- This turned out to be a real, general gap, not just a manual-testing
+-- footgun: confirmed in-game that after some play sessions M.enabled and
+-- M.fullControlEnabled both read false with ZERO "beamai_core" log lines at
+-- all (filtering the console log for "beamai" showed nothing) -- meaning
+-- onClientStartMission genuinely never fired that session (e.g. the level
+-- was already loaded before this extension's own load/reload happened).
+-- Fixed with M.onExtensionLoaded() below (a real, confirmed hook -- see
+-- lua/ge/extensions/core/busRouteManager.lua for the exact same pattern
+-- shipped in the game itself): it calls the CONFIRMED real global
+-- getMissionFilename() (also used the same way in environment.lua,
+-- gamestate.lua, vehicles.lua, trafficSignals.lua) to check whether a level
+-- is already loaded at the moment this extension loads, and self-activates
+-- immediately if so, instead of only reacting to a future level-load event
+-- that may never come.
 --
 -- Obstacle avoidance while in full control: implemented (updateFullControlAvoidance
 -- below) by offsetting our own pure-pursuit lookahead target sideways
@@ -759,7 +773,10 @@ end
 -- and others), fired once a level finishes loading, with the level path. If we
 -- have a bundled graph for this level, load it and switch on automatically --
 -- no console commands needed for the zip-and-drop test (README.md).
-function M.onClientStartMission(levelPath)
+-- Shared by both onClientStartMission (fires on a fresh level load) and
+-- onExtensionLoaded (fires when this extension itself loads/reloads -- see
+-- below for why that second path is necessary too).
+local function activateForLevel(levelPath)
   local levelName = path.levelFromPath(levelPath)
   local graphPath = BUNDLED_GRAPHS[levelName]
   if not graphPath then
@@ -772,6 +789,33 @@ function M.onClientStartMission(levelPath)
       M.setFullControlEnabled(true) -- flag only; applied per vehicle as registerAll picks each one up below
     end
     M.setEnabled(true) -- triggers onUpdate, which auto-registers every vehicle within REGISTER_SCAN_INTERVAL seconds
+  end
+end
+
+function M.onClientStartMission(levelPath)
+  activateForLevel(levelPath)
+end
+
+-- CONFIRMED real hook (lua/ge/extensions/core/busRouteManager.lua, which
+-- uses exactly this pattern): fires once when this extension itself is
+-- loaded or reloaded (extensions.reload("beamai_core")), taking no
+-- arguments -- unlike onClientStartMission, which only fires on an actual
+-- fresh level load. Without this, a real gap existed: if the level was
+-- already loaded before this extension loaded/reloaded (e.g. the mod was
+-- installed/updated mid-session, or something else caused the extension to
+-- (re)load after the mission had already started), onClientStartMission
+-- would simply never fire again and the mod would silently stay disabled
+-- forever -- confirmed in practice (M.enabled/M.fullControlEnabled both
+-- read false in-game with no "beamai_core" log lines at all, i.e.
+-- onClientStartMission never ran). getMissionFilename() (CONFIRMED real,
+-- engine-exposed global, used the same way in busRouteManager.lua,
+-- environment.lua, gamestate.lua, vehicles.lua, trafficSignals.lua) returns
+-- the current level's path, or "" if no level is loaded (e.g. main menu) --
+-- treat that exactly as if onClientStartMission had just fired with it.
+function M.onExtensionLoaded()
+  local levelPath = getMissionFilename()
+  if levelPath and levelPath ~= "" then
+    activateForLevel(levelPath)
   end
 end
 

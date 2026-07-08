@@ -246,6 +246,62 @@ do
   check("aims at the end of the final leg (x=100), not beyond", math.abs(point[1] - 100) < 1e-6)
 end
 
+print("Test 16: findRoute scales to a larger, programmatically-built graph and still finds a real shortcut")
+do
+  -- A long main chain of 40 unit segments (chain_0 .. chain_39, each 10m,
+  -- laid out along +X) plus a single "bypass" segment directly connecting
+  -- the junction after chain_2 to the junction after chain_35, short-cutting
+  -- 33 hops. Exercises the binary min-heap (heapPush/heapPop in router.lua)
+  -- with many more nodes/pushes than the small hand-built graphs above --
+  -- this is the kind of scale (west_coast_usa has ~1300 segments) where the
+  -- previous linear-scan open set was a real, confirmed in-game performance
+  -- bug (120 -> 25 FPS the moment several vehicles needed a route at once).
+  -- The chain zigzags a little in Y (0 or 3, alternating) so its actual
+  -- travelled arc length between two points is slightly MORE than the
+  -- straight-line distance between them -- otherwise a "bypass" running
+  -- straight between two points already on a straight line could never be
+  -- genuinely shorter than the chain itself (a straight line is already the
+  -- shortest path between two points), making the "prefers the real
+  -- shortcut" assertion below untestable.
+  local N = 40
+  local function zigzagY(i) return (i % 2) * 3 end
+  local segments = {}
+  local junctions = {}
+  for i = 0, N - 1 do
+    segments[#segments + 1] = seg("chain_" .. i, { { i * 10, zigzagY(i), 0 }, { (i + 1) * 10, zigzagY(i + 1), 0 } })
+  end
+  for i = 1, N - 1 do
+    junctions[#junctions + 1] = junc("j_" .. i, { i * 10, zigzagY(i), 0 }, { "chain_" .. (i - 1), "chain_" .. i })
+  end
+  -- Bypass: a single straight segment directly between the existing
+  -- junctions at i=3 (x=30) and i=36 (x=360), instead of the 33 zigzagging
+  -- 10m-ish hops between them. Adds "bypass" to those junctions' own
+  -- approaches rather than creating new junctions at the same positions:
+  -- two junctions occupying the same spot would silently overwrite each
+  -- other in buildIndex's per-segment-end lookup (whichever junction is
+  -- processed last for a shared segment end wins), breaking the main
+  -- chain's own connectivity right where the bypass was meant to attach.
+  local j3pos = { 3 * 10, zigzagY(3), 0 }
+  local j36pos = { 36 * 10, zigzagY(36), 0 }
+  segments[#segments + 1] = seg("bypass", { j3pos, j36pos })
+  table.insert(junctions[3].approaches, "bypass")  -- j_3, at x=30
+  table.insert(junctions[36].approaches, "bypass") -- j_36, at x=360
+
+  local index = router.buildIndex({ segments = segments, junctions = junctions })
+  local route = router.findRoute(index, "chain_0", "start", "chain_" .. (N - 1))
+  check("found a route across the whole graph", route ~= nil)
+  if route then
+    local usesBypass = false
+    for _, step in ipairs(route) do
+      if step.segId == "bypass" then
+        usesBypass = true
+      end
+    end
+    check("takes the bypass instead of all 40 chain hops", usesBypass)
+    check("route is much shorter than the full chain (fewer than 15 steps, not ~40)", #route < 15)
+  end
+end
+
 print("")
 if failures == 0 then
   print("ALL TESTS PASSED")
