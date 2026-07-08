@@ -407,4 +407,139 @@ function M.findLookaheadPointOnRoute(index, route, routeIndex, ownProj, lookahea
   return roadGraph.pointAtDistance(lastSeg.nodes, endDist), #route
 end
 
+-- Shared by findUpcomingTrafficLight and findUpcomingPriorityJunction below:
+-- walks forward from `ownProj` on `segment` (travelling in the direction
+-- implied by `entryEnd` -- "start" means heading toward the segment's last
+-- node, "end" means the reverse), following "continuation" junctions (the
+-- same logical road split into consecutive DecalRoad pieces) until it
+-- reaches the nearest non-continuation junction of ANY type, or runs out of
+-- maxLookahead, or the mapped graph ends.
+--
+-- Performance note (this replaced roadGraph.lua's original
+-- findUpcomingTrafficLight/findUpcomingPriorityJunction, which each did
+-- their OWN separate traversal): each step used to call
+-- roadGraph.findJunctionNear (a full O(junction count) linear distance scan
+-- over all ~646 junction candidates on west_coast_usa) and
+-- roadGraph.findSegmentById (a full O(segment count) linear scan over all
+-- ~1300 segments) -- and did so TWICE per vehicle per tick, once for each
+-- function, once traffic lights and stop-priority junctions both became
+-- default-on features. That was a real, confirmed in-game performance bug
+-- (a sustained ~120 -> 30 FPS drop, not just a one-time burst like the A*
+-- open-set fix above). This version uses `index` (router.buildIndex),
+-- already built once per graph load specifically to answer "which junction
+-- touches this segment's end" and "which segment has this id" in O(1) --
+-- and walks the traversal exactly once, shared by both callers below,
+-- instead of twice.
+--
+-- Returns junction, distanceToStopLine (metres from ownProj),
+-- arrivalSegId (the specific segment actually being driven when the
+-- junction is reached -- needed by findUpcomingPriorityJunction to look up
+-- that approach's own priority rule), or nil, nil, nil.
+local function walkToNextRealJunction(index, segment, entryEnd, ownProj, maxLookahead)
+  local distanceSoFar
+  if entryEnd == "start" then
+    distanceSoFar = roadGraph.segmentLength(segment.nodes) - ownProj.distanceAlong
+  else
+    distanceSoFar = ownProj.distanceAlong
+  end
+
+  local currentSegId = segment.id
+  local currentEntryEnd = entryEnd
+  local visited = { [currentSegId] = true }
+
+  while distanceSoFar <= maxLookahead do
+    local juncId
+    if currentEntryEnd == "start" then
+      juncId = index.juncAtEnd[currentSegId]
+    else
+      juncId = index.juncAtStart[currentSegId]
+    end
+    if not juncId then
+      return nil, nil, nil -- dead end / edge of the mapped graph
+    end
+    local junction = index.junctionById[juncId]
+    if not junction then
+      return nil, nil, nil
+    end
+    if junction.type ~= "continuation" then
+      return junction, distanceSoFar, currentSegId
+    end
+
+    local nextSegId = nil
+    for _, sid in ipairs(junction.approaches) do
+      if sid ~= currentSegId then
+        nextSegId = sid
+      end
+    end
+    if not nextSegId or visited[nextSegId] then
+      return nil, nil, nil
+    end
+    visited[nextSegId] = true
+
+    local nextSeg = index.segmentById[nextSegId]
+    if not nextSeg then
+      return nil, nil, nil
+    end
+    local nextEntryEnd
+    if index.juncAtStart[nextSegId] == juncId then
+      nextEntryEnd = "start"
+    else
+      nextEntryEnd = "end"
+    end
+
+    distanceSoFar = distanceSoFar + roadGraph.segmentLength(nextSeg.nodes)
+    currentSegId = nextSegId
+    currentEntryEnd = nextEntryEnd
+  end
+
+  return nil, nil, nil
+end
+
+-- Looks ahead (through continuation segments) for the nearest upcoming
+-- trafficLight junction, so a light several segments ahead is found early
+-- enough to brake comfortably, instead of only being noticed once the
+-- vehicle is on the final short segment leading into it. Stops looking
+-- (returns nil) at a real, unclassified junction encountered first -- turning
+-- there is a decision this v0 does not make (roadmap phase 2).
+--
+-- Returns junction, distanceToStopLine (metres from ownProj) or nil, nil.
+function M.findUpcomingTrafficLight(index, segment, entryEnd, ownProj, maxLookahead)
+  local junction, distance = walkToNextRealJunction(index, segment, entryEnd, ownProj, maxLookahead)
+  if junction and junction.type == "trafficLight" then
+    return junction, distance
+  end
+  return nil, nil
+end
+
+-- Looks ahead (through continuation segments) for the nearest upcoming
+-- non-signalized real junction (type == "junction") -- one with a stop/yield
+-- priority rule assigned by tools/extract_road_graph.py's
+-- assign_junction_priority (roadClass hierarchy, or an all-way-stop default
+-- when no class hierarchy exists). Stops looking at a trafficLight junction
+-- or an unclassified one encountered first (out of scope here -- see
+-- findUpcomingTrafficLight for the traffic-light case).
+--
+-- Returns junction, distanceToStopLine (metres from ownProj), mustYield
+-- (whether the specific approach segment actually being driven when the
+-- junction is reached must yield -- fails safe to true, i.e. yield, if this
+-- approach isn't listed for some reason), or nil, nil, nil if none found
+-- within maxLookahead.
+function M.findUpcomingPriorityJunction(index, segment, entryEnd, ownProj, maxLookahead)
+  local junction, distance, arrivalSegId = walkToNextRealJunction(index, segment, entryEnd, ownProj, maxLookahead)
+  if not junction or junction.type ~= "junction" then
+    return nil, nil, nil
+  end
+
+  local mustYield = true -- fail safe: an unlisted approach must yield
+  if junction.approachPriority then
+    for _, ap in ipairs(junction.approachPriority) do
+      if ap.segmentId == arrivalSegId then
+        mustYield = ap.mustYield
+        break
+      end
+    end
+  end
+  return junction, distance, mustYield
+end
+
 return M

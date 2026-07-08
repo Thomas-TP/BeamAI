@@ -103,46 +103,6 @@ do
   check("returns nil when out of radius", notFound == nil)
 end
 
-print("Test 7: findUpcomingTrafficLight follows continuations to find a light ahead")
-do
-  local segA = { id = "segA", nodes = { { 0, 0, 0, 3.5 }, { 50, 0, 0, 3.5 } } }
-  local segB = { id = "segB", nodes = { { 50, 0, 0, 3.5 }, { 100, 0, 0, 3.5 } } }
-  local segC = { id = "segC", nodes = { { 100, 0, 0, 3.5 }, { 150, 0, 0, 3.5 } } }
-  local graph = {
-    segments = { segA, segB, segC },
-    junctions = {
-      { id = "j1", type = "continuation", position = { 50, 0, 0 }, approaches = { "segA", "segB" } },
-      { id = "j2", type = "continuation", position = { 100, 0, 0 }, approaches = { "segB", "segC" } },
-      { id = "j3", type = "trafficLight", position = { 150, 0, 0 }, approaches = { "segC" } },
-    },
-  }
-  local ownProj = rg.closestPointOnPolyline(segA.nodes, { 10, 0, 0 }) -- 40m left on segA
-
-  local junction, dist = rg.findUpcomingTrafficLight(graph, segA, ownProj, 200, 6.0)
-  check("finds the light through two continuations", junction ~= nil and junction.id == "j3")
-  check("distance is 40 (rest of segA) + 50 (segB) + 50 (segC) = 140", near(dist, 140, 1e-6))
-
-  local junction2 = rg.findUpcomingTrafficLight(graph, segA, ownProj, 100, 6.0)
-  check("returns nil when the light is beyond maxLookahead", junction2 == nil)
-end
-
-print("Test 8: findUpcomingTrafficLight stops at a real (unclassified) junction")
-do
-  local segA = { id = "segA", nodes = { { 0, 0, 0, 3.5 }, { 50, 0, 0, 3.5 } } }
-  local segB = { id = "segB", nodes = { { 50, 0, 0, 3.5 }, { 100, 0, 0, 3.5 } } }
-  local segC = { id = "segC", nodes = { { 100, 0, 0, 3.5 }, { 150, 0, 0, 3.5 } } }
-  local graph = {
-    segments = { segA, segB, segC },
-    junctions = {
-      { id = "j1", type = "junction", position = { 50, 0, 0 }, approaches = { "segA", "segB" } },
-      { id = "j2", type = "trafficLight", position = { 100, 0, 0 }, approaches = { "segB", "segC" } },
-    },
-  }
-  local ownProj = rg.closestPointOnPolyline(segA.nodes, { 10, 0, 0 })
-  local junction = rg.findUpcomingTrafficLight(graph, segA, ownProj, 200, 6.0)
-  check("does not see the light past a real junction", junction == nil)
-end
-
 print("Test 9: normalize and dot")
 do
   local n = rg.normalize({ 3, 4, 0 })
@@ -287,81 +247,6 @@ do
   local graph = { segments = { { id = "a" }, { id = "b" } } }
   check("finds existing id", rg.findSegmentById(graph, "b").id == "b")
   check("returns nil for missing id", rg.findSegmentById(graph, "zzz") == nil)
-end
-
-print("Test 20: findUpcomingPriorityJunction finds the nearest real junction and this approach's mustYield")
-do
-  local segA = { id = "segA", nodes = { { 0, 0, 0, 3.5 }, { 50, 0, 0, 3.5 } } }
-  local segB = { id = "segB", nodes = { { 50, 0, 0, 3.5 }, { 100, 0, 0, 3.5 } } }
-  local graph = {
-    segments = { segA, segB },
-    junctions = {
-      {
-        id = "j1", type = "junction", position = { 50, 0, 0 }, approaches = { "segA", "segB" },
-        priorityRule = "allWayStop",
-        approachPriority = {
-          { segmentId = "segA", mustYield = true },
-          { segmentId = "segB", mustYield = true },
-        },
-      },
-    },
-  }
-  local ownProj = rg.closestPointOnPolyline(segA.nodes, { 10, 0, 0 }) -- 40m left on segA
-
-  local junction, dist, mustYield = rg.findUpcomingPriorityJunction(graph, segA, ownProj, 200, 6.0)
-  check("finds the junction", junction ~= nil and junction.id == "j1")
-  check("distance to the stop line is 40m", near(dist, 40, 1e-6))
-  check("this approach (segA) must yield", mustYield == true)
-end
-
-print("Test 21: findUpcomingPriorityJunction respects a road-class-hierarchy approach that has priority")
-do
-  local segMinor = { id = "minor", nodes = { { 0, 0, 0, 3.5 }, { 50, 0, 0, 3.5 } } }
-  local segMajor = { id = "major", nodes = { { 50, 0, 0, 3.5 }, { 100, 0, 0, 3.5 } } }
-  local graph = {
-    segments = { segMinor, segMajor },
-    junctions = {
-      {
-        id = "j1", type = "junction", position = { 50, 0, 0 }, approaches = { "minor", "major" },
-        priorityRule = "roadClassHierarchy",
-        approachPriority = {
-          { segmentId = "minor", mustYield = true },
-          { segmentId = "major", mustYield = false },
-        },
-      },
-    },
-  }
-  local ownProjMinor = rg.closestPointOnPolyline(segMinor.nodes, { 10, 0, 0 })
-  local _, _, mustYieldMinor = rg.findUpcomingPriorityJunction(graph, segMinor, ownProjMinor, 200, 6.0)
-  check("the minor approach must yield", mustYieldMinor == true)
-
-  local ownProjMajor = rg.closestPointOnPolyline(segMajor.nodes, { 60, 0, 0 })
-  -- Approaching the SAME junction from the major road's own far end would need a segment
-  -- ending there; here we just directly check the priority list interpretation instead.
-  local found = false
-  for _, ap in ipairs(graph.junctions[1].approachPriority) do
-    if ap.segmentId == "major" then
-      found = (ap.mustYield == false)
-    end
-  end
-  check("the major approach has priority (does not yield)", found == true)
-end
-
-print("Test 22: findUpcomingPriorityJunction ignores trafficLight and continuation junctions")
-do
-  local segA = { id = "segA", nodes = { { 0, 0, 0, 3.5 }, { 50, 0, 0, 3.5 } } }
-  local segB = { id = "segB", nodes = { { 50, 0, 0, 3.5 }, { 100, 0, 0, 3.5 } } }
-  local segC = { id = "segC", nodes = { { 100, 0, 0, 3.5 }, { 150, 0, 0, 3.5 } } }
-  local graph = {
-    segments = { segA, segB, segC },
-    junctions = {
-      { id = "j1", type = "continuation", position = { 50, 0, 0 }, approaches = { "segA", "segB" } },
-      { id = "j2", type = "trafficLight", position = { 100, 0, 0 }, approaches = { "segB", "segC" } },
-    },
-  }
-  local ownProj = rg.closestPointOnPolyline(segA.nodes, { 10, 0, 0 })
-  local junction = rg.findUpcomingPriorityJunction(graph, segA, ownProj, 200, 6.0)
-  check("does not treat a trafficLight junction as a priority junction", junction == nil)
 end
 
 print("Test 23: isCrossTrafficNearJunction")

@@ -138,8 +138,13 @@ function M.pointAtDistance(nodes, targetDistance)
 end
 
 -- Finds the closest junction to `point` within `radius` metres, or nil if none.
--- Used to check whether a segment's far end (the direction of travel) leads
--- into a signalized junction -- see core.lua.
+-- O(junction count) linear scan -- fine for findLookaheadPoint below (the
+-- fallback path used only when a vehicle has no active route yet, so it
+-- runs rarely, not every tick for every vehicle). The traffic-light/priority
+-- junction lookahead used to depend on this too but was moved to
+-- router.lua's O(1) index-based walkToNextRealJunction after this scan (x2
+-- per vehicle per tick, once fully wired up) was confirmed to cause a
+-- sustained in-game FPS drop -- see router.lua for details.
 function M.findJunctionNear(graph, point, radius)
   local best, bestDist = nil, nil
   for _, j in ipairs(graph.junctions) do
@@ -149,118 +154,6 @@ function M.findJunctionNear(graph, point, radius)
     end
   end
   return best
-end
-
--- Looks ahead from `ownProj` (on `segment`) for the nearest upcoming
--- trafficLight junction, transparently following "continuation" junctions
--- (the same logical road split into consecutive DecalRoad pieces -- see
--- tools/extract_road_graph.py classify_cluster) so a light several segments
--- ahead is found early enough to brake comfortably, instead of only being
--- noticed once the vehicle is on the final short segment leading into it.
--- Stops looking (returns nil) at a real, unclassified junction -- turning
--- there is a decision this v0 does not make (roadmap phase 2).
---
--- Returns junction, distanceToStopLine (metres from ownProj) or nil, nil.
-function M.findUpcomingTrafficLight(graph, segment, ownProj, maxLookahead, junctionRadius)
-  local distanceSoFar = M.segmentLength(segment.nodes) - ownProj.distanceAlong
-  local currentSeg = segment
-  local visited = { [segment.id] = true }
-
-  while distanceSoFar <= maxLookahead do
-    local endNode = currentSeg.nodes[#currentSeg.nodes]
-    local junction = M.findJunctionNear(graph, { endNode[1], endNode[2], endNode[3] }, junctionRadius)
-    if not junction then
-      return nil, nil
-    end
-    if junction.type == "trafficLight" then
-      return junction, distanceSoFar
-    end
-    if junction.type ~= "continuation" then
-      return nil, nil -- a real junction (or unclassified): phase-2 territory, stop here
-    end
-
-    local nextId = nil
-    for _, sid in ipairs(junction.approaches) do
-      if sid ~= currentSeg.id then
-        nextId = sid
-      end
-    end
-    if not nextId or visited[nextId] then
-      return nil, nil
-    end
-    visited[nextId] = true
-
-    local nextSeg = M.findSegmentById(graph, nextId)
-    if not nextSeg then
-      return nil, nil
-    end
-    distanceSoFar = distanceSoFar + M.segmentLength(nextSeg.nodes)
-    currentSeg = nextSeg
-  end
-
-  return nil, nil
-end
-
--- Looks ahead (through continuation segments) for the nearest upcoming
--- non-signalized real junction (type == "junction") -- one with a stop/yield
--- priority rule assigned by tools/extract_road_graph.py's
--- assign_junction_priority (roadClass hierarchy, or an all-way-stop default
--- when no class hierarchy exists). Stops looking at a trafficLight junction
--- or an unclassified one (out of scope here -- see findUpcomingTrafficLight
--- for the traffic-light case).
---
--- Returns junction, distanceToStopLine (metres from ownProj), mustYield
--- (whether the specific approach segment actually being driven when the
--- junction is reached must yield -- fails safe to true, i.e. yield, if this
--- approach isn't listed for some reason), or nil, nil, nil if none found
--- within maxLookahead.
-function M.findUpcomingPriorityJunction(graph, segment, ownProj, maxLookahead, junctionRadius)
-  local distanceSoFar = M.segmentLength(segment.nodes) - ownProj.distanceAlong
-  local currentSeg = segment
-  local visited = { [segment.id] = true }
-
-  while distanceSoFar <= maxLookahead do
-    local endNode = currentSeg.nodes[#currentSeg.nodes]
-    local junction = M.findJunctionNear(graph, { endNode[1], endNode[2], endNode[3] }, junctionRadius)
-    if not junction then
-      return nil, nil, nil
-    end
-    if junction.type == "junction" then
-      local mustYield = true -- fail safe: an unlisted approach must yield
-      if junction.approachPriority then
-        for _, ap in ipairs(junction.approachPriority) do
-          if ap.segmentId == currentSeg.id then
-            mustYield = ap.mustYield
-            break
-          end
-        end
-      end
-      return junction, distanceSoFar, mustYield
-    end
-    if junction.type ~= "continuation" then
-      return nil, nil, nil -- trafficLight or unclassified: not this function's concern
-    end
-
-    local nextId = nil
-    for _, sid in ipairs(junction.approaches) do
-      if sid ~= currentSeg.id then
-        nextId = sid
-      end
-    end
-    if not nextId or visited[nextId] then
-      return nil, nil, nil
-    end
-    visited[nextId] = true
-
-    local nextSeg = M.findSegmentById(graph, nextId)
-    if not nextSeg then
-      return nil, nil, nil
-    end
-    distanceSoFar = distanceSoFar + M.segmentLength(nextSeg.nodes)
-    currentSeg = nextSeg
-  end
-
-  return nil, nil, nil
 end
 
 -- Whether any position in `otherPositions` (list of {pos={x,y,z}, speed=n})

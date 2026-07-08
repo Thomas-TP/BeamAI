@@ -16,8 +16,9 @@
 --   1. Late braking at lights -- findStopLineConstraint only checked the
 --      *current* segment's end; on a road chopped into several short DecalRoad
 --      pieces, a red light several segments ahead wasn't seen until the very
---      last one. Now uses roadGraph.findUpcomingTrafficLight, which looks
---      ahead through "continuation" segments (see tools/extract_road_graph.py).
+--      last one. Now uses router.findUpcomingTrafficLight (moved there from
+--      roadGraph.lua later on, see below), which looks ahead through
+--      "continuation" segments (see tools/extract_road_graph.py).
 --   2. Hesitating mid-turn at intersections -- findLeaderOnSegment treated any
 --      nearby tracked vehicle as "ahead of us", including cross-traffic that
 --      merely projects close to our polyline right where segments converge at
@@ -627,14 +628,23 @@ end
 -- Fails safe by design (docs/ARCHITECTURE.md section 4.5): if the live state
 -- can't be read at all, isStopState(nil) is true, so an unreadable light is
 -- treated as red, never as green.
-local function findStopLineConstraint(graph, segment, ownProj, vehState)
-  local junction, distance = roadGraph.findUpcomingTrafficLight(
-    graph, segment, ownProj, MAX_LIGHT_LOOKAHEAD, JUNCTION_SEARCH_RADIUS)
+local function findStopLineConstraint(routingIndex, segment, entryEnd, ownProj, vehState)
+  local junction, distance = router.findUpcomingTrafficLight(
+    routingIndex, segment, entryEnd, ownProj, MAX_LIGHT_LOOKAHEAD)
   if not junction then
     return nil
   end
 
+  -- tangentAtProjection always points in the segment's own nodes[1]->nodes[n]
+  -- order; flip it when actually travelling the other way (entryEnd=="end")
+  -- so pickBestInstance/queryLiveState picks the light facing our real
+  -- direction of travel, not the opposite one. A latent bug fixed as a
+  -- byproduct of adding entryEnd-awareness here (this whole lookahead used
+  -- to silently assume forward travel only).
   local travelDir = roadGraph.tangentAtProjection(segment.nodes, ownProj)
+  if entryEnd == "end" then
+    travelDir = { -travelDir[1], -travelDir[2], -travelDir[3] }
+  end
   local state = trafficLights.queryLiveState(junction.trafficLightInstances, travelDir)
   if state == nil and not warnedNoLiveTrafficLightState then
     warnedNoLiveTrafficLightState = true
@@ -678,9 +688,9 @@ end
 -- already come to its mandatory stop -- rather than every tick for every
 -- tracked vehicle, matching the same lazy pattern updateFullControlAvoidance
 -- uses for its own clearance check.
-local function findJunctionPriorityConstraint(graph, segment, ownProj, vehState, ownVehId, leaderVehId, ownSpeed, positionsById)
-  local junction, distance, mustYield = roadGraph.findUpcomingPriorityJunction(
-    graph, segment, ownProj, MAX_LIGHT_LOOKAHEAD, JUNCTION_SEARCH_RADIUS)
+local function findJunctionPriorityConstraint(routingIndex, segment, entryEnd, ownProj, vehState, ownVehId, leaderVehId, ownSpeed, positionsById)
+  local junction, distance, mustYield = router.findUpcomingPriorityJunction(
+    routingIndex, segment, entryEnd, ownProj, MAX_LIGHT_LOOKAHEAD)
   if not junction or not mustYield then
     return nil
   end
@@ -872,6 +882,11 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
     local segment, ownProj = roadGraph.findNearestSegmentNear(M.graph, data.pos, vehState.lastSegment)
     if segment and ownProj then
       vehState.lastSegment = segment
+      -- Computed once per vehicle per tick and reused by routing, the
+      -- traffic-light lookahead, and the priority-junction lookahead below --
+      -- a two-way segment can legally be driven in either direction, so this
+      -- can't be assumed from the segment's own node order alone.
+      local entryEnd = guessEntryEnd(segment, ownProj, data.heading)
       local vehGap, vehLeaderSpeed, vehLeaderId = findLeaderOnSegment(segment, vehId, ownProj, positionsById)
 
       -- Under full control there's no native side_avoidance left to nudge (it
@@ -892,11 +907,11 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         end
       end
 
-      local lightGap = findStopLineConstraint(M.graph, segment, ownProj, vehState)
+      local lightGap = findStopLineConstraint(M.routingIndex, segment, entryEnd, ownProj, vehState)
       local junctionGap = nil
       if M.junctionPriorityEnabled then
         junctionGap = findJunctionPriorityConstraint(
-          M.graph, segment, ownProj, vehState, vehId, vehLeaderId, data.speed, positionsById)
+          M.routingIndex, segment, entryEnd, ownProj, vehState, vehId, vehLeaderId, data.speed, positionsById)
       end
 
       -- Whichever obstacle is nearer along the path is the binding constraint
@@ -935,7 +950,6 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
         if M.routingEnabled and M.routingIndex then
           local syncedIndex = syncRouteIndex(vehState.route, vehState.routeIndex, segment.id)
           if not syncedIndex then
-            local entryEnd = guessEntryEnd(segment, ownProj, data.heading)
             syncedIndex = planNewRouteIfBudgetAllows(vehState, routePlanBudget, segment.id, entryEnd)
           end
           if syncedIndex then

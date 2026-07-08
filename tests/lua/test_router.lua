@@ -7,6 +7,7 @@
 -- module tests use.
 package.path = package.path .. ";" .. (arg[0]:match("(.*)tests[/\\]lua[/\\]") or "./") .. "mod/lua/ge/extensions/?.lua"
 local router = require("beamai/router")
+local roadGraph = require("beamai/roadGraph")
 
 local failures = 0
 local function check(name, cond)
@@ -300,6 +301,130 @@ do
     check("takes the bypass instead of all 40 chain hops", usesBypass)
     check("route is much shorter than the full chain (fewer than 15 steps, not ~40)", #route < 15)
   end
+end
+
+-- Tests 17-21 below were originally roadGraph.lua's findUpcomingTrafficLight/
+-- findUpcomingPriorityJunction tests, moved here along with the functions
+-- themselves (now index-based, O(1), and entryEnd-aware -- see router.lua's
+-- walkToNextRealJunction for why).
+
+print("Test 17: findUpcomingTrafficLight follows continuations to find a light ahead")
+do
+  local segA = seg("segA", { { 0, 0, 0, 3.5 }, { 50, 0, 0, 3.5 } })
+  local segB = seg("segB", { { 50, 0, 0, 3.5 }, { 100, 0, 0, 3.5 } })
+  local segC = seg("segC", { { 100, 0, 0, 3.5 }, { 150, 0, 0, 3.5 } })
+  local graph = {
+    segments = { segA, segB, segC },
+    junctions = {
+      { id = "j1", type = "continuation", position = { 50, 0, 0 }, approaches = { "segA", "segB" } },
+      { id = "j2", type = "continuation", position = { 100, 0, 0 }, approaches = { "segB", "segC" } },
+      { id = "j3", type = "trafficLight", position = { 150, 0, 0 }, approaches = { "segC" } },
+    },
+  }
+  local index = router.buildIndex(graph)
+  local ownProj = roadGraph.closestPointOnPolyline(segA.nodes, { 10, 0, 0 }) -- 40m left on segA
+
+  local junction, dist = router.findUpcomingTrafficLight(index, segA, "start", ownProj, 200)
+  check("finds the light through two continuations", junction ~= nil and junction.id == "j3")
+  check("distance is 40 (rest of segA) + 50 (segB) + 50 (segC) = 140", math.abs(dist - 140) < 1e-6)
+
+  local junction2 = router.findUpcomingTrafficLight(index, segA, "start", ownProj, 100)
+  check("returns nil when the light is beyond maxLookahead", junction2 == nil)
+end
+
+print("Test 18: findUpcomingTrafficLight stops at a real (unclassified) junction")
+do
+  local segA = seg("segA", { { 0, 0, 0, 3.5 }, { 50, 0, 0, 3.5 } })
+  local segB = seg("segB", { { 50, 0, 0, 3.5 }, { 100, 0, 0, 3.5 } })
+  local segC = seg("segC", { { 100, 0, 0, 3.5 }, { 150, 0, 0, 3.5 } })
+  local graph = {
+    segments = { segA, segB, segC },
+    junctions = {
+      { id = "j1", type = "junction", position = { 50, 0, 0 }, approaches = { "segA", "segB" } },
+      { id = "j2", type = "trafficLight", position = { 100, 0, 0 }, approaches = { "segB", "segC" } },
+    },
+  }
+  local index = router.buildIndex(graph)
+  local ownProj = roadGraph.closestPointOnPolyline(segA.nodes, { 10, 0, 0 })
+  local junction = router.findUpcomingTrafficLight(index, segA, "start", ownProj, 200)
+  check("does not see the light past a real junction", junction == nil)
+end
+
+print("Test 19: findUpcomingPriorityJunction finds the nearest real junction and this approach's mustYield")
+do
+  local segA = seg("segA", { { 0, 0, 0, 3.5 }, { 50, 0, 0, 3.5 } })
+  local segB = seg("segB", { { 50, 0, 0, 3.5 }, { 100, 0, 0, 3.5 } })
+  local graph = {
+    segments = { segA, segB },
+    junctions = {
+      {
+        id = "j1", type = "junction", position = { 50, 0, 0 }, approaches = { "segA", "segB" },
+        priorityRule = "allWayStop",
+        approachPriority = {
+          { segmentId = "segA", mustYield = true },
+          { segmentId = "segB", mustYield = true },
+        },
+      },
+    },
+  }
+  local index = router.buildIndex(graph)
+  local ownProj = roadGraph.closestPointOnPolyline(segA.nodes, { 10, 0, 0 }) -- 40m left on segA
+
+  local junction, dist, mustYield = router.findUpcomingPriorityJunction(index, segA, "start", ownProj, 200)
+  check("finds the junction", junction ~= nil and junction.id == "j1")
+  check("distance to the stop line is 40m", math.abs(dist - 40) < 1e-6)
+  check("this approach (segA) must yield", mustYield == true)
+end
+
+print("Test 20: findUpcomingPriorityJunction respects a road-class-hierarchy approach that has priority")
+do
+  local segMinor = seg("minor", { { 0, 0, 0, 3.5 }, { 50, 0, 0, 3.5 } })
+  local segMajor = seg("major", { { 50, 0, 0, 3.5 }, { 100, 0, 0, 3.5 } })
+  local graph = {
+    segments = { segMinor, segMajor },
+    junctions = {
+      {
+        id = "j1", type = "junction", position = { 50, 0, 0 }, approaches = { "minor", "major" },
+        priorityRule = "roadClassHierarchy",
+        approachPriority = {
+          { segmentId = "minor", mustYield = true },
+          { segmentId = "major", mustYield = false },
+        },
+      },
+    },
+  }
+  local index = router.buildIndex(graph)
+  local ownProjMinor = roadGraph.closestPointOnPolyline(segMinor.nodes, { 10, 0, 0 })
+  local _, _, mustYieldMinor = router.findUpcomingPriorityJunction(index, segMinor, "start", ownProjMinor, 200)
+  check("the minor approach must yield", mustYieldMinor == true)
+
+  -- Approaching the SAME junction from the major road's own far end (travelling
+  -- "end" -> "start", i.e. backward relative to segMajor's own node order):
+  -- exercises the entryEnd-aware directionality fix directly, not just the
+  -- priority-list interpretation.
+  local ownProjMajor = roadGraph.closestPointOnPolyline(segMajor.nodes, { 90, 0, 0 }) -- 40m from major's end, travelling backward
+  local majorJunction, majorDist, mustYieldMajor = router.findUpcomingPriorityJunction(index, segMajor, "end", ownProjMajor, 200)
+  check("found the junction travelling backward along major", majorJunction ~= nil and majorJunction.id == "j1")
+  check("distance travelling backward is 40m", math.abs(majorDist - 40) < 1e-6)
+  check("the major approach has priority (does not yield)", mustYieldMajor == false)
+end
+
+print("Test 21: findUpcomingPriorityJunction ignores trafficLight and continuation junctions")
+do
+  local segA = seg("segA", { { 0, 0, 0, 3.5 }, { 50, 0, 0, 3.5 } })
+  local segB = seg("segB", { { 50, 0, 0, 3.5 }, { 100, 0, 0, 3.5 } })
+  local segC = seg("segC", { { 100, 0, 0, 3.5 }, { 150, 0, 0, 3.5 } })
+  local graph = {
+    segments = { segA, segB, segC },
+    junctions = {
+      { id = "j1", type = "continuation", position = { 50, 0, 0 }, approaches = { "segA", "segB" } },
+      { id = "j2", type = "trafficLight", position = { 100, 0, 0 }, approaches = { "segB", "segC" } },
+    },
+  }
+  local index = router.buildIndex(graph)
+  local ownProj = roadGraph.closestPointOnPolyline(segA.nodes, { 10, 0, 0 })
+  local junction = router.findUpcomingPriorityJunction(index, segA, "start", ownProj, 200)
+  check("does not treat a trafficLight junction as a priority junction", junction == nil)
 end
 
 print("")
