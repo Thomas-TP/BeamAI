@@ -219,13 +219,25 @@ M.avoidanceEnabled = false
 M.fullControlEnabled = false
 M.autoScanEnabled = true
 -- Whether onClientStartMission switches straight to full custom control for
--- every vehicle on a bundled map, with zero console commands needed. ON by
--- default per explicit request: launching the game and loading a supported
--- map (see BUNDLED_GRAPHS) is meant to be enough on its own. Flip to false
--- with M.setAutoFullControlOnStart(false) to fall back to the older,
--- lower-risk ai.setSpeed-only path (still real, still tested in-game, just
--- doesn't touch steering) while diagnosing an issue.
-M.autoFullControlOnStart = true
+-- every vehicle on a bundled map, with zero console commands needed.
+--
+-- OFF by default as of this revision -- reversed from an earlier ON default
+-- after a direct, controlled in-game comparison: 6 native-driven traffic
+-- vehicles held 120 FPS, 6 vehicles under full custom control (steering +
+-- throttle/brake computed and dispatched by us every tick, replacing
+-- ai.lua's own driving entirely) dropped to 30 FPS -- a real, measured, per-
+-- vehicle cost that doesn't scale with vehicle count, so it isn't something
+-- that only shows up "at scale". A hard budget was set explicitly: no more
+-- than ~5 FPS lost versus stock native traffic. Full custom control cannot
+-- meet that budget yet, so it is no longer the default -- the code stays
+-- (real, tested, and a genuine longer-term ambition), but native ai.lua now
+-- drives again by default, with this mod only overriding what native
+-- driving actually gets wrong (see dispatchSpeed/findJunctionPriorityConstraint
+-- for the stop-sign safety fix, and updatePlayerMergeSafety for the merge
+-- safety mitigation, both below) -- an approach with near-zero added
+-- per-tick cost, since ai.lua's own steering/path-following logic runs
+-- regardless of what drives it, native or us.
+M.autoFullControlOnStart = false
 M.graph = nil
 -- router.buildIndex(M.graph) result, rebuilt whenever M.graph changes (see
 -- setGraphPath) -- expensive to build (scans every junction/segment once) so
@@ -719,6 +731,44 @@ local function findJunctionPriorityConstraint(routingIndex, segment, entryEnd, o
   return nil -- stopped once, junction is clear: go
 end
 
+-- Merge/lane-change safety toward the player -- a MITIGATION, not a
+-- root-cause fix (see the header comment on M.autoFullControlOnStart for
+-- why we're not replacing native steering entirely anymore). Confirmed by
+-- reading lua/vehicle/ai.lua directly: its own lane-change safety check
+-- (ego.ghostL/ego.ghostR, which blocks a lane change into an occupied lane)
+-- only looks at whether another vehicle is within roughly 1.2x combined
+-- vehicle lengths RIGHT NOW (ai.lua ~line 2238: `ego2v < square((1.2 *
+-- ego.length + 1.2*v.length))`) -- it never considers a vehicle further
+-- back that's closing in fast, and that threshold is baked into ai.lua, not
+-- exposed as a parameter we can override. route.laneChanges/ego.ghostL/R
+-- are module-local to ai.lua too, so we can't inspect or cancel a specific
+-- lane-change decision from outside. What we CAN do cheaply: notice when a
+-- tracked (native-driven) vehicle is actively drifting sideways on its own
+-- lane (a lane change plausibly in progress) while the player is following
+-- fairly close behind it in roughly the same lateral band, and temporarily
+-- cap that vehicle's own dispatched speed to open the gap it leaves --
+-- makes a cut-in in front of the player less abrupt/close, without editing
+-- ai.lua or costing more than a few vector operations per vehicle per tick.
+local PLAYER_MERGE_WATCH_RADIUS_M = 25.0 -- metres behind the vehicle within which the player triggers this mitigation
+local PLAYER_MERGE_LATERAL_BAND_M = 6.0 -- how far to the side of the vehicle's own lane the player still counts as "in the way"
+local PLAYER_MERGE_LATERAL_SPEED_THRESHOLD_MS = 0.3 -- m/s of lateral drift counted as "actively changing lanes"
+local PLAYER_MERGE_SPEED_CAP_FACTOR = 0.6 -- fraction of the vehicle's own current speed to cap it to when triggered
+
+local function playerMergeSpeedCap(segment, ownProj, data, playerPos, playerVehId, ownVehId)
+  if not playerPos or playerVehId == ownVehId then
+    return nil
+  end
+
+  local lateralDir = roadGraph.lateralDirectionAtProjection(segment.nodes, ownProj)
+  local lateralSpeed = roadGraph.dot(data.vel, lateralDir)
+  if roadGraph.isRiskyMergeTarget(
+      data.pos, data.heading, lateralDir, lateralSpeed, playerPos,
+      PLAYER_MERGE_WATCH_RADIUS_M, PLAYER_MERGE_LATERAL_BAND_M, PLAYER_MERGE_LATERAL_SPEED_THRESHOLD_MS) then
+    return data.speed * PLAYER_MERGE_SPEED_CAP_FACTOR
+  end
+  return nil
+end
+
 -- Which end of `segment` the vehicle is currently heading toward, inferred
 -- from its real heading vector vs. the segment's tangent at its own
 -- projection -- needed to seed router.findRoute/planRandomRoute with the
@@ -874,6 +924,17 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
 
   local routePlanBudget = { remaining = MAX_ROUTE_PLANS_PER_TICK }
 
+  -- For playerMergeSpeedCap below -- computed once per tick, not per vehicle.
+  local playerPos, playerVehId = nil, nil
+  do
+    local playerVeh = be:getPlayerVehicle(0)
+    if playerVeh then
+      playerVehId = playerVeh:getID()
+      local p = playerVeh:getPosition()
+      playerPos = { p.x, p.y, p.z }
+    end
+  end
+
   for vehId, data in pairs(positionsById) do
     local vehState = trackedVehicles[vehId]
     -- Sticky segment lookup: reuses last tick's segment when it still fits,
@@ -934,6 +995,11 @@ function M.onUpdate(dtReal, dtSim, dtRaw)
       end
 
       local targetSpeed = idm.nextSpeed(data.speed, leaderSpeed or 0, gap, dtSim, idmParams)
+
+      local mergeSpeedCap = playerMergeSpeedCap(segment, ownProj, data, playerPos, playerVehId, vehId)
+      if mergeSpeedCap then
+        targetSpeed = math.min(targetSpeed, mergeSpeedCap)
+      end
 
       if M.fullControlEnabled then
         local lookahead = steeringController.lookaheadDistance(data.speed)

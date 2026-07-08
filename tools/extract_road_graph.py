@@ -99,10 +99,10 @@ ROAD_CLASS_WIDTH_THRESHOLDS = [
     (0.0, "residential"),
 ]
 DEFAULT_SPEED_LIMIT_KMH = {
-    "trunk": 110,
-    "primary": 80,
-    "secondary": 50,
-    "residential": 30,
+    "trunk": 130,      # autoroute
+    "primary": 80,     # route
+    "secondary": 50,   # ville
+    "residential": 30, # zone residentielle / zone 30
 }
 
 

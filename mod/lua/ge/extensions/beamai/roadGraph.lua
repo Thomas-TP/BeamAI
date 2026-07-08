@@ -180,6 +180,27 @@ function M.isCrossTrafficNearJunction(junctionPosition, otherPositions, radius, 
   return false
 end
 
+-- Whether `otherPos` (typically the player) is close enough behind `ownPos`,
+-- roughly within `ownPos`'s own lane, that `ownPos` actively drifting
+-- sideways (a lane change in progress, per `ownLateralSpeed`) risks cutting
+-- it off -- used by core.lua's playerMergeSpeedCap mitigation for a
+-- confirmed gap in ai.lua's own lane-change safety check (see that
+-- function's header comment: ai.lua only looks ~1.2x combined vehicle
+-- lengths ahead/adjacent, never further back). Pure geometry, no BeamNG
+-- dependency.
+function M.isRiskyMergeTarget(ownPos, ownHeading, lateralDir, ownLateralSpeed, otherPos, watchRadius, lateralBand, lateralSpeedThreshold)
+  if math.abs(ownLateralSpeed) < lateralSpeedThreshold then
+    return false -- not currently drifting sideways -- no lane change in progress worth reacting to
+  end
+
+  local heading = M.normalize(ownHeading)
+  local toOther = { otherPos[1] - ownPos[1], otherPos[2] - ownPos[2], otherPos[3] - ownPos[3] }
+  local behindDist = -M.dot(toOther, heading) -- positive when `otherPos` is behind `ownPos`
+  local lateralDist = math.abs(M.dot(toOther, lateralDir))
+
+  return behindDist > 0 and behindDist < watchRadius and lateralDist < lateralBand
+end
+
 -- The world-space point `lookaheadDistance` metres ahead of `ownProj` (on
 -- `segment`) along the path, for the pure-pursuit steering controller
 -- (steeringController.lua). Transparently crosses into the next segment

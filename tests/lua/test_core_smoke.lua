@@ -44,7 +44,8 @@ if ok then
   check("onClientStartMission is a function", type(core.onClientStartMission) == "function")
   check("onClientEndMission is a function", type(core.onClientEndMission) == "function")
   check("starts disabled", core.enabled == false)
-  check("full control defaults to on for auto-registered vehicles", core.autoFullControlOnStart == true)
+  check("full control defaults to OFF (native ai.lua drives by default -- see core.lua header comment)",
+    core.autoFullControlOnStart == false)
   check("routing defaults to on", core.routingEnabled == true)
   check("junction priority defaults to on", core.junctionPriorityEnabled == true)
   check("no routing index until a graph is loaded", core.routingIndex == nil)

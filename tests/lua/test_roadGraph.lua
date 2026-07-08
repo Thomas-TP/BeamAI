@@ -265,6 +265,32 @@ do
   check("no other vehicles at all -> clear", rg.isCrossTrafficNearJunction(junctionPos, {}, 18.0, 0.5) == false)
 end
 
+print("Test 24: isRiskyMergeTarget")
+do
+  local ownPos = { 0, 0, 0 }
+  local heading = { 1, 0, 0 } -- driving along +X
+  local lateralDir = { 0, 1, 0 } -- perpendicular, as lateralDirectionAtProjection would give for this heading
+  local watchRadius, lateralBand, lateralSpeedThreshold = 25.0, 6.0, 0.3
+
+  check("player behind, in-lane, own vehicle drifting sideways -> risky",
+    rg.isRiskyMergeTarget(ownPos, heading, lateralDir, 0.5, { -15, 1, 0 }, watchRadius, lateralBand, lateralSpeedThreshold))
+
+  check("same position, but not drifting sideways (below threshold) -> not risky",
+    rg.isRiskyMergeTarget(ownPos, heading, lateralDir, 0.1, { -15, 1, 0 }, watchRadius, lateralBand, lateralSpeedThreshold) == false)
+
+  check("player AHEAD instead of behind -> not risky",
+    rg.isRiskyMergeTarget(ownPos, heading, lateralDir, 0.5, { 15, 1, 0 }, watchRadius, lateralBand, lateralSpeedThreshold) == false)
+
+  check("player behind but beyond the watch radius -> not risky",
+    rg.isRiskyMergeTarget(ownPos, heading, lateralDir, 0.5, { -40, 1, 0 }, watchRadius, lateralBand, lateralSpeedThreshold) == false)
+
+  check("player behind but well outside the lateral band (different lane entirely) -> not risky",
+    rg.isRiskyMergeTarget(ownPos, heading, lateralDir, 0.5, { -15, 10, 0 }, watchRadius, lateralBand, lateralSpeedThreshold) == false)
+
+  check("negative lateral drift (drifting the other way) still counts as actively changing lanes",
+    rg.isRiskyMergeTarget(ownPos, heading, lateralDir, -0.5, { -15, -1, 0 }, watchRadius, lateralBand, lateralSpeedThreshold))
+end
+
 print("Test 19: offsetPointLateral")
 do
   local pt = rg.offsetPointLateral({ 10, 20, 0 }, { 0, 1, 0 }, 2.5)
